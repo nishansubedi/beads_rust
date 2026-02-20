@@ -38,7 +38,7 @@ mod common;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::BufWriter;

@@ -354,11 +354,11 @@ impl<'de> Deserialize<'de> for EventType {
 }
 
 impl JsonSchema for EventType {
-    fn schema_name() -> String {
-        "EventType".to_string()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("EventType")
     }
 
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    fn json_schema(generator: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
         // EventType serializes as a string (see custom Serialize/Deserialize above).
         generator.subschema_for::<String>()
     }

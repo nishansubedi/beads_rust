@@ -431,17 +431,16 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
 
     // Load existing config or create new
     // Note: Files with only YAML comments parse as Null, not as an error
-    let mut config: serde_yaml::Value = if config_path.exists() {
+    let mut config: serde_yml::Value = if config_path.exists() {
         let contents = fs::read_to_string(&config_path)?;
-        match serde_yaml::from_str(&contents) {
-            Ok(serde_yaml::Value::Null) => {
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::default())
+        match serde_yml::from_str(&contents) {
+            Ok(serde_yml::Value::Null) | Err(_) => {
+                serde_yml::Value::Mapping(serde_yml::Mapping::default())
             }
             Ok(v) => v,
-            Err(_) => serde_yaml::Value::Mapping(serde_yaml::Mapping::default()),
         }
     } else {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::default())
+        serde_yml::Value::Mapping(serde_yml::Mapping::default())
     };
 
     // Set the value
@@ -450,11 +449,11 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
     set_yaml_value(
         &mut config,
         &parts,
-        serde_yaml::Value::String(value.to_string()),
+        serde_yml::Value::String(value.to_string()),
     );
 
     // Write back
-    let yaml_str = serde_yaml::to_string(&config)?;
+    let yaml_str = serde_yml::to_string(&config)?;
     fs::write(&config_path, yaml_str)?;
 
     info!(
@@ -515,43 +514,43 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
     Ok(())
 }
 
-fn set_yaml_value(config: &mut serde_yaml::Value, parts: &[&str], value: serde_yaml::Value) {
+fn set_yaml_value(config: &mut serde_yml::Value, parts: &[&str], value: serde_yml::Value) {
     if parts.is_empty() {
         return;
     }
 
-    if !matches!(config, serde_yaml::Value::Mapping(_)) {
-        *config = serde_yaml::Value::Mapping(serde_yaml::Mapping::default());
+    if !matches!(config, serde_yml::Value::Mapping(_)) {
+        *config = serde_yml::Value::Mapping(serde_yml::Mapping::default());
     }
 
     if parts.len() == 1 {
-        if let serde_yaml::Value::Mapping(map) = config {
-            map.insert(serde_yaml::Value::String(parts[0].to_string()), value);
+        if let serde_yml::Value::Mapping(map) = config {
+            map.insert(serde_yml::Value::String(parts[0].to_string()), value);
         }
         return;
     }
 
-    if let serde_yaml::Value::Mapping(map) = config {
-        let key = serde_yaml::Value::String(parts[0].to_string());
+    if let serde_yml::Value::Mapping(map) = config {
+        let key = serde_yml::Value::String(parts[0].to_string());
         let entry = map
             .entry(key)
-            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
+            .or_insert_with(|| serde_yml::Value::Mapping(serde_yml::Mapping::default()));
 
-        if !matches!(entry, serde_yaml::Value::Mapping(_)) {
-            *entry = serde_yaml::Value::Mapping(serde_yaml::Mapping::default());
+        if !matches!(entry, serde_yml::Value::Mapping(_)) {
+            *entry = serde_yml::Value::Mapping(serde_yml::Mapping::default());
         }
 
         set_yaml_value(entry, &parts[1..], value);
     }
 }
 
-fn get_yaml_value(value: &serde_yaml::Value, parts: &[&str]) -> Option<String> {
+fn get_yaml_value(value: &serde_yml::Value, parts: &[&str]) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
 
-    if let serde_yaml::Value::Mapping(map) = value {
-        let key = serde_yaml::Value::String(parts[0].to_string());
+    if let serde_yml::Value::Mapping(map) = value {
+        let key = serde_yml::Value::String(parts[0].to_string());
         let child = map.get(&key)?;
         if parts.len() == 1 {
             return yaml_value_to_string(child);
@@ -562,13 +561,13 @@ fn get_yaml_value(value: &serde_yaml::Value, parts: &[&str]) -> Option<String> {
     None
 }
 
-fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
+fn yaml_value_to_string(value: &serde_yml::Value) -> Option<String> {
     match value {
-        serde_yaml::Value::Null => Some("null".to_string()),
-        serde_yaml::Value::Bool(value) => Some(value.to_string()),
-        serde_yaml::Value::Number(value) => Some(value.to_string()),
-        serde_yaml::Value::String(value) => Some(value.clone()),
-        _ => serde_yaml::to_string(value)
+        serde_yml::Value::Null => Some("null".to_string()),
+        serde_yml::Value::Bool(value) => Some(value.to_string()),
+        serde_yml::Value::Number(value) => Some(value.to_string()),
+        serde_yml::Value::String(value) => Some(value.clone()),
+        _ => serde_yml::to_string(value)
             .ok()
             .map(|value| value.trim().to_string()),
     }
@@ -599,11 +598,11 @@ fn delete_config_value(
         let config_path = dir.join("config.yaml");
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let mut config: serde_yaml::Value = serde_yaml::from_str(&contents)
-                .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
+            let mut config: serde_yml::Value = serde_yml::from_str(&contents)
+                .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
 
             if delete_from_yaml(&mut config, key) {
-                let yaml_str = serde_yaml::to_string(&config)?;
+                let yaml_str = serde_yml::to_string(&config)?;
                 fs::write(&config_path, yaml_str)?;
                 project_deleted = true;
             }
@@ -615,11 +614,11 @@ fn delete_config_value(
     if let Some(config_path) = get_user_config_path() {
         if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let mut config: serde_yaml::Value = serde_yaml::from_str(&contents)
-                .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
+            let mut config: serde_yml::Value = serde_yml::from_str(&contents)
+                .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
 
             if delete_from_yaml(&mut config, key) {
-                let yaml_str = serde_yaml::to_string(&config)?;
+                let yaml_str = serde_yml::to_string(&config)?;
                 fs::write(&config_path, yaml_str)?;
                 user_deleted = true;
             }
@@ -681,18 +680,18 @@ fn delete_config_value(
 
     Ok(())
 }
-fn delete_from_yaml(value: &mut serde_yaml::Value, key: &str) -> bool {
+fn delete_from_yaml(value: &mut serde_yml::Value, key: &str) -> bool {
     let parts: Vec<&str> = key.split('.').collect();
     delete_nested(value, &parts)
 }
 
-fn delete_nested(value: &mut serde_yaml::Value, path: &[&str]) -> bool {
+fn delete_nested(value: &mut serde_yml::Value, path: &[&str]) -> bool {
     if path.is_empty() {
         return false;
     }
 
-    if let serde_yaml::Value::Mapping(map) = value {
-        let key = serde_yaml::Value::String(path[0].to_string());
+    if let serde_yml::Value::Mapping(map) = value {
+        let key = serde_yml::Value::String(path[0].to_string());
 
         if path.len() == 1 {
             return map.remove(&key).is_some();
@@ -981,50 +980,50 @@ mod tests {
 
     #[test]
     fn test_set_yaml_value_overwrites_scalar_root() {
-        let mut config = serde_yaml::Value::String("legacy".to_string());
+        let mut config = serde_yml::Value::String("legacy".to_string());
         let parts = ["display"];
         set_yaml_value(
             &mut config,
             &parts,
-            serde_yaml::Value::String("true".to_string()),
+            serde_yml::Value::String("true".to_string()),
         );
 
-        let serde_yaml::Value::Mapping(map) = config else {
+        let serde_yml::Value::Mapping(map) = config else {
             unreachable!("expected mapping root");
         };
-        let key = serde_yaml::Value::String("display".to_string());
+        let key = serde_yml::Value::String("display".to_string());
         assert_eq!(
             map.get(&key),
-            Some(&serde_yaml::Value::String("true".to_string()))
+            Some(&serde_yml::Value::String("true".to_string()))
         );
     }
 
     #[test]
     fn test_set_yaml_value_overwrites_scalar_child() {
-        let mut map = serde_yaml::Mapping::default();
+        let mut map = serde_yml::Mapping::default();
         map.insert(
-            serde_yaml::Value::String("display".to_string()),
-            serde_yaml::Value::String("legacy".to_string()),
+            serde_yml::Value::String("display".to_string()),
+            serde_yml::Value::String("legacy".to_string()),
         );
-        let mut config = serde_yaml::Value::Mapping(map);
+        let mut config = serde_yml::Value::Mapping(map);
         let parts = ["display", "color"];
         set_yaml_value(
             &mut config,
             &parts,
-            serde_yaml::Value::String("blue".to_string()),
+            serde_yml::Value::String("blue".to_string()),
         );
 
-        let serde_yaml::Value::Mapping(root) = config else {
+        let serde_yml::Value::Mapping(root) = config else {
             unreachable!("expected mapping root");
         };
-        let display_key = serde_yaml::Value::String("display".to_string());
-        let Some(serde_yaml::Value::Mapping(display_map)) = root.get(&display_key) else {
+        let display_key = serde_yml::Value::String("display".to_string());
+        let Some(serde_yml::Value::Mapping(display_map)) = root.get(&display_key) else {
             unreachable!("expected display mapping");
         };
-        let color_key = serde_yaml::Value::String("color".to_string());
+        let color_key = serde_yml::Value::String("color".to_string());
         assert_eq!(
             display_map.get(&color_key),
-            Some(&serde_yaml::Value::String("blue".to_string()))
+            Some(&serde_yml::Value::String("blue".to_string()))
         );
     }
 }

@@ -11,7 +11,7 @@ use chrono::Utc;
 use common::cli::extract_json_payload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use serde_yaml::Value as YamlValue;
+use serde_yml::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -5179,8 +5179,8 @@ fn conformance_init_config() {
     assert!(!br_config.trim().is_empty(), "br config.yaml is empty");
     assert!(!bd_config.trim().is_empty(), "bd config.yaml is empty");
 
-    let br_yaml: Result<YamlValue, _> = serde_yaml::from_str(&br_config);
-    let bd_yaml: Result<YamlValue, _> = serde_yaml::from_str(&bd_config);
+    let br_yaml: Result<YamlValue, _> = serde_yml::from_str(&br_config);
+    let bd_yaml: Result<YamlValue, _> = serde_yml::from_str(&bd_config);
 
     assert_eq!(
         br_yaml.is_ok(),

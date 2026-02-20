@@ -598,7 +598,7 @@ impl ConfigLayer {
         }
 
         let contents = fs::read_to_string(path)?;
-        let value: serde_yaml::Value = serde_yaml::from_str(&contents)?;
+        let value: serde_yml::Value = serde_yml::from_str(&contents)?;
         Ok(layer_from_yaml_value(&value))
     }
 
@@ -1108,7 +1108,7 @@ fn lock_timeout_from_layer(layer: &ConfigLayer) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
-fn layer_from_yaml_value(value: &serde_yaml::Value) -> ConfigLayer {
+fn layer_from_yaml_value(value: &serde_yml::Value) -> ConfigLayer {
     let mut layer = ConfigLayer::default();
     let mut flat = HashMap::new();
     flatten_yaml(value, "", &mut flat);
@@ -1120,9 +1120,9 @@ fn layer_from_yaml_value(value: &serde_yaml::Value) -> ConfigLayer {
     layer
 }
 
-fn flatten_yaml(value: &serde_yaml::Value, prefix: &str, out: &mut HashMap<String, String>) {
+fn flatten_yaml(value: &serde_yml::Value, prefix: &str, out: &mut HashMap<String, String>) {
     match value {
-        serde_yaml::Value::Mapping(map) => {
+        serde_yml::Value::Mapping(map) => {
             for (key, value) in map {
                 let Some(key_str) = key.as_str() else {
                     continue;
@@ -1135,7 +1135,7 @@ fn flatten_yaml(value: &serde_yaml::Value, prefix: &str, out: &mut HashMap<Strin
                 flatten_yaml(value, &next_prefix, out);
             }
         }
-        serde_yaml::Value::Sequence(values) => {
+        serde_yml::Value::Sequence(values) => {
             let joined = values
                 .iter()
                 .filter_map(yaml_scalar_to_string)
@@ -1151,15 +1151,15 @@ fn flatten_yaml(value: &serde_yaml::Value, prefix: &str, out: &mut HashMap<Strin
     }
 }
 
-fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+fn yaml_scalar_to_string(value: &serde_yml::Value) -> Option<String> {
     match value {
-        serde_yaml::Value::Bool(v) => Some(v.to_string()),
-        serde_yaml::Value::Number(n) => Some(n.to_string()),
-        serde_yaml::Value::String(s) => Some(s.clone()),
-        serde_yaml::Value::Null
-        | serde_yaml::Value::Sequence(_)
-        | serde_yaml::Value::Mapping(_) => None,
-        serde_yaml::Value::Tagged(tagged) => yaml_scalar_to_string(&tagged.value),
+        serde_yml::Value::Bool(v) => Some(v.to_string()),
+        serde_yml::Value::Number(n) => Some(n.to_string()),
+        serde_yml::Value::String(s) => Some(s.clone()),
+        serde_yml::Value::Null | serde_yml::Value::Sequence(_) | serde_yml::Value::Mapping(_) => {
+            None
+        }
+        serde_yml::Value::Tagged(tagged) => yaml_scalar_to_string(&tagged.value),
     }
 }
 
@@ -1230,7 +1230,7 @@ mod tests {
 no-db: true
 issue_prefix: bd
 ";
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse yaml");
+        let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
         let layer = layer_from_yaml_value(&value);
         assert_eq!(layer.startup.get("no-db").unwrap(), "true");
         assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "bd");
@@ -1243,7 +1243,7 @@ labels:
   - backend
   - api
 ";
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse yaml");
+        let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
         let layer = layer_from_yaml_value(&value);
         assert_eq!(layer.runtime.get("labels").unwrap(), "backend,api");
     }
@@ -1787,7 +1787,7 @@ git:
 routing:
   policy: fifo
 ";
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse yaml");
+        let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
         let layer = layer_from_yaml_value(&value);
 
         // git.* and routing.* prefixes go to startup (per is_startup_key)

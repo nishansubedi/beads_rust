@@ -13,7 +13,7 @@ use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
 use crate::{config, output};
 use chrono::{DateTime, Utc};
-use schemars::schema::RootSchema;
+use schemars::Schema;
 use schemars::schema_for;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ struct ErrorBody {
 struct SchemaOutput {
     tool: &'static str,
     generated_at: DateTime<Utc>,
-    schemas: BTreeMap<&'static str, RootSchema>,
+    schemas: BTreeMap<&'static str, Schema>,
 }
 
 /// Execute the schema command to generate JSON Schema documents.
@@ -88,7 +88,7 @@ pub fn execute(
     Ok(())
 }
 
-fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, RootSchema> {
+fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
     let mut schemas = BTreeMap::new();
 
     match target {

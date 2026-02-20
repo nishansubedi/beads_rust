@@ -101,8 +101,7 @@ impl SqliteStorage {
         if let Some(timeout) = lock_timeout_ms {
             conn.busy_timeout(Duration::from_millis(timeout))?;
         }
-        let user_version: i32 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if user_version < CURRENT_SCHEMA_VERSION {
             apply_schema(&conn)?;
         }
@@ -3092,24 +3091,28 @@ impl SqliteStorage {
             closed_at: row
                 .get::<_, Option<String>>(16)?
                 .as_deref()
-                .map(parse_datetime).transpose()?,
+                .map(parse_datetime)
+                .transpose()?,
             close_reason: Self::empty_to_none(row.get::<_, Option<String>>(17)?),
             closed_by_session: Self::empty_to_none(row.get::<_, Option<String>>(18)?),
             due_at: row
                 .get::<_, Option<String>>(19)?
                 .as_deref()
-                .map(parse_datetime).transpose()?,
+                .map(parse_datetime)
+                .transpose()?,
             defer_until: row
                 .get::<_, Option<String>>(20)?
                 .as_deref()
-                .map(parse_datetime).transpose()?,
+                .map(parse_datetime)
+                .transpose()?,
             external_ref: row.get::<_, Option<String>>(21)?,
             source_system: Self::empty_to_none(row.get::<_, Option<String>>(22)?),
             source_repo: Self::empty_to_none(row.get::<_, Option<String>>(23)?),
             deleted_at: row
                 .get::<_, Option<String>>(24)?
                 .as_deref()
-                .map(parse_datetime).transpose()?,
+                .map(parse_datetime)
+                .transpose()?,
             deleted_by: Self::empty_to_none(row.get::<_, Option<String>>(25)?),
             delete_reason: Self::empty_to_none(row.get::<_, Option<String>>(26)?),
             original_type: Self::empty_to_none(row.get::<_, Option<String>>(27)?),
@@ -3117,7 +3120,8 @@ impl SqliteStorage {
             compacted_at: row
                 .get::<_, Option<String>>(29)?
                 .as_deref()
-                .map(parse_datetime).transpose()?,
+                .map(parse_datetime)
+                .transpose()?,
             compacted_at_commit: row.get::<_, Option<String>>(30)?,
             original_size: row.get::<_, Option<i32>>(31)?,
             sender: Self::empty_to_none(row.get::<_, Option<String>>(32)?),
