@@ -16,6 +16,7 @@ fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
+    let json_error_mode = should_render_errors_as_json(&cli);
     let output_ctx = OutputContext::from_args(&cli);
 
     // Initialize logging
@@ -31,7 +32,7 @@ fn main() {
 
     if should_auto_import(&cli.command) && !cli.no_db {
         if let Err(e) = run_auto_import(&overrides, cli.allow_stale, cli.no_auto_import) {
-            handle_error(&e, cli.json);
+            handle_error(&e, json_error_mode);
         }
     }
 
@@ -126,7 +127,7 @@ fn main() {
 
     // Handle command result
     if let Err(e) = result {
-        handle_error(&e, cli.json);
+        handle_error(&e, json_error_mode);
     }
 
     // Auto-flush after successful mutating commands (unless --no-auto-flush)
@@ -207,6 +208,26 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         #[cfg(feature = "self_update")]
         Commands::Upgrade(_) => false,
     }
+}
+
+const fn command_requests_robot_json(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Close(args) => args.robot,
+        Commands::Reopen(args) => args.robot,
+        Commands::Ready(args) => args.robot,
+        Commands::Blocked(args) => args.robot,
+        Commands::Stats(args) | Commands::Status(args) => args.robot,
+        Commands::Defer(args) => args.robot,
+        Commands::Undefer(args) => args.robot,
+        Commands::Orphans(args) => args.robot,
+        Commands::Changelog(args) => args.robot,
+        Commands::Sync(args) => args.robot,
+        _ => false,
+    }
+}
+
+const fn should_render_errors_as_json(cli: &Cli) -> bool {
+    cli.json || command_requests_robot_json(&cli.command)
 }
 
 /// Run auto-import before read-only commands when JSONL is newer.

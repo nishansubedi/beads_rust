@@ -4,9 +4,10 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history;
+use chrono::NaiveDateTime;
 use rich_rust::prelude::*;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
@@ -141,11 +142,16 @@ fn diff_backup(
         )));
     }
 
-    let current_path = beads_dir.join("issues.jsonl");
+    let current_path = current_jsonl_path_for_backup(beads_dir, filename)?;
+    let current_name = current_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     if !current_path.exists() {
-        return Err(BeadsError::Config(
-            "Current issues.jsonl not found".to_string(),
-        ));
+        return Err(BeadsError::Config(format!(
+            "Current {current_name} not found"
+        )));
     }
 
     if ctx.is_json() {
@@ -170,14 +176,14 @@ fn diff_backup(
 
     if ctx.is_rich() {
         let theme = ctx.theme();
-        let header = format!("Current: issues.jsonl\nBackup: {filename}");
+        let header = format!("Current: {current_name}\nBackup: {filename}");
         let panel = Panel::from_text(&header)
             .title(Text::styled("History Diff", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Diffing current issues.jsonl vs {filename}...");
+        println!("Diffing current {current_name} vs {filename}...");
     }
 
     // Let's shell out to `diff -u` for now as it's standard on linux/mac.
@@ -243,15 +249,20 @@ fn restore_backup(
         )));
     }
 
-    let target_path = beads_dir.join("issues.jsonl");
+    let target_path = current_jsonl_path_for_backup(beads_dir, filename)?;
+    let target_name = target_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
     if target_path.exists() && !force {
-        return Err(BeadsError::Config(
-            "Current issues.jsonl exists. Use --force to overwrite.".to_string(),
-        ));
+        return Err(BeadsError::Config(format!(
+            "Current {target_name} exists. Use --force to overwrite."
+        )));
     }
 
-    // Copy backup to issues.jsonl
+    // Copy backup to the corresponding JSONL file stem.
     std::fs::copy(&backup_path, &target_path)?;
 
     if ctx.is_json() {
@@ -273,14 +284,14 @@ fn restore_backup(
     if ctx.is_rich() {
         let theme = ctx.theme();
         let body =
-            format!("Restored {filename} to issues.jsonl.\nNext: br sync --import-only --force");
+            format!("Restored {filename} to {target_name}.\nNext: br sync --import-only --force");
         let panel = Panel::from_text(&body)
             .title(Text::styled("History Restore", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Restored {filename} to issues.jsonl");
+        println!("Restored {filename} to {target_name}");
         println!("Run 'br sync --import-only --force' to import this state into the database.");
     }
 
@@ -358,6 +369,27 @@ fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffS
     }
 }
 
+fn current_jsonl_path_for_backup(beads_dir: &Path, filename: &str) -> Result<PathBuf> {
+    let Some(without_ext) = filename.strip_suffix(".jsonl") else {
+        return Err(BeadsError::Config(format!(
+            "Invalid backup filename format: {filename}"
+        )));
+    };
+    let Some((stem, timestamp)) = without_ext.rsplit_once('.') else {
+        return Err(BeadsError::Config(format!(
+            "Invalid backup filename format: {filename}"
+        )));
+    };
+
+    if stem.is_empty() || NaiveDateTime::parse_from_str(timestamp, "%Y%m%d_%H%M%S").is_err() {
+        return Err(BeadsError::Config(format!(
+            "Invalid backup filename format: {filename}"
+        )));
+    }
+
+    Ok(beads_dir.join(format!("{stem}.jsonl")))
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -369,5 +401,82 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::OutputContext;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_issues_stem() {
+        let temp = TempDir::new().unwrap();
+        let path =
+            current_jsonl_path_for_backup(temp.path(), "issues.20260220_120000.jsonl").unwrap();
+        assert_eq!(path, temp.path().join("issues.jsonl"));
+    }
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_custom_stem_with_dot() {
+        let temp = TempDir::new().unwrap();
+        let path =
+            current_jsonl_path_for_backup(temp.path(), "issues.snapshot.20260220_120000.jsonl")
+                .unwrap();
+        assert_eq!(path, temp.path().join("issues.snapshot.jsonl"));
+    }
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_rejects_invalid_name() {
+        let temp = TempDir::new().unwrap();
+        let err =
+            current_jsonl_path_for_backup(temp.path(), "issues.not-a-timestamp.jsonl").unwrap_err();
+
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_restore_backup_uses_backup_stem_target_path() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let backup_name = "custom.20260220_120000.jsonl";
+        fs::write(history_dir.join(backup_name), "new-state\n").unwrap();
+        fs::write(beads_dir.join("custom.jsonl"), "old-state\n").unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        restore_backup(beads_dir, &history_dir, backup_name, true, &ctx).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(beads_dir.join("custom.jsonl")).unwrap(),
+            "new-state\n"
+        );
+        assert!(!beads_dir.join("issues.jsonl").exists());
+    }
+
+    #[test]
+    fn test_diff_backup_reports_missing_current_stem_file() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path();
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+
+        let backup_name = "custom.20260220_120000.jsonl";
+        fs::write(history_dir.join(backup_name), "backup\n").unwrap();
+
+        let ctx = OutputContext::from_flags(false, true, true);
+        let err = diff_backup(beads_dir, &history_dir, backup_name, &ctx).unwrap_err();
+
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("Current custom.jsonl not found")),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

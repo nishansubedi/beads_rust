@@ -1354,7 +1354,7 @@ pub struct ListArgs {
     pub all: bool,
 
     /// Maximum number of results (0 = unlimited, default: 50)
-    #[arg(long)]
+    #[arg(long, default_value = "50")]
     pub limit: Option<usize>,
 
     /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
@@ -2389,4 +2389,28 @@ pub struct AgentsArgs {
     /// Skip confirmation prompts
     #[arg(long, short = 'f')]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn test_list_limit_defaults_to_50() {
+        let cli = Cli::parse_from(["br", "list"]);
+        match cli.command {
+            Commands::List(args) => assert_eq!(args.limit, Some(50)),
+            _ => panic!("expected list command"),
+        }
+    }
+
+    #[test]
+    fn test_list_limit_zero_parses_as_unlimited() {
+        let cli = Cli::parse_from(["br", "list", "--limit", "0"]);
+        match cli.command {
+            Commands::List(args) => assert_eq!(args.limit, Some(0)),
+            _ => panic!("expected list command"),
+        }
+    }
 }

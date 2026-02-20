@@ -1044,7 +1044,11 @@ impl SqliteStorage {
         }
 
         if !filters.include_closed {
-            sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
         }
 
         if !filters.include_templates {
@@ -5120,6 +5124,43 @@ mod tests {
             "Should find one issue matching 'authentication'"
         );
         assert_eq!(results[0].id, "bd-s1");
+    }
+
+    #[test]
+    fn test_search_issues_respects_include_deferred_flag() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 9, 1, 0, 0, 0).unwrap();
+
+        let open_issue = make_issue(
+            "bd-s-open",
+            "authentication flow update",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let deferred_issue = make_issue(
+            "bd-s-deferred",
+            "authentication flow deferred follow-up",
+            Status::Deferred,
+            2,
+            None,
+            t1,
+            None,
+        );
+
+        storage.create_issue(&open_issue, "tester").unwrap();
+        storage.create_issue(&deferred_issue, "tester").unwrap();
+
+        let filters = ListFilters {
+            include_deferred: false,
+            ..ListFilters::default()
+        };
+        let results = storage.search_issues("authentication", &filters).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "bd-s-open");
     }
 
     #[test]
