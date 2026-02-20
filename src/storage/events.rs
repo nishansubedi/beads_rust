@@ -82,7 +82,7 @@ pub fn insert_event(
     )?;
 
     let row = conn.query_row("SELECT last_insert_rowid()")?;
-    let id = row.get(0).and_then(|v| v.as_integer()).unwrap_or(0);
+    let id = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
     Ok(id)
 }
 
