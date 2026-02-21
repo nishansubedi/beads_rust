@@ -19,9 +19,20 @@ clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
+# NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
 fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "/dp/frankensqlite/crates/fsqlite-types" }
 fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
+fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
+fsqlite-func = { path = "/dp/frankensqlite/crates/fsqlite-func" }
+fsqlite-vdbe = { path = "/dp/frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-vfs = { path = "/dp/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-pager = { path = "/dp/frankensqlite/crates/fsqlite-pager" }
+fsqlite-parser = { path = "/dp/frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/dp/frankensqlite/crates/fsqlite-planner" }
+fsqlite-wal = { path = "/dp/frankensqlite/crates/fsqlite-wal" }
+fsqlite-btree = { path = "/dp/frankensqlite/crates/fsqlite-btree" }
+fsqlite-ast = { path = "/dp/frankensqlite/crates/fsqlite-ast" }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }

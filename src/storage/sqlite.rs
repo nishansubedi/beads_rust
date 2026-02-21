@@ -5016,6 +5016,307 @@ mod tests {
     }
 
     #[test]
+    fn test_diag_data_visibility() {
+        use fsqlite_types::value::SqliteValue;
+        // Simplest possible reproduction
+        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        conn.execute("CREATE TABLE t (k TEXT, v TEXT)").unwrap();
+        conn.execute_with_params("INSERT INTO t VALUES (?, ?)", &[SqliteValue::from("a"), SqliteValue::from("b")]).unwrap();
+
+        // 1: count without WHERE
+        let r1 = conn.query_with_params("SELECT count(*) FROM t", &[]).unwrap();
+        eprintln!("[DIAG] 1. count(*) no WHERE: {:?}", r1.first().map(|r| r.values()));
+
+        // 2: count with literal WHERE
+        let r2 = conn.query_with_params("SELECT count(*) FROM t WHERE k = 'a'", &[]).unwrap();
+        eprintln!("[DIAG] 2. count(*) literal WHERE: {:?}", r2.first().map(|r| r.values()));
+
+        // 3: count with bind WHERE
+        let explain3 = conn.prepare("SELECT count(*) FROM t WHERE k = ?")
+            .map(|s| s.explain())
+            .unwrap_or_else(|e| format!("PREPARE ERROR: {e}"));
+        for line in explain3.lines() {
+            eprintln!("[DIAG] 3.E| {line}");
+        }
+        if explain3.is_empty() {
+            eprintln!("[DIAG] 3.E| (empty)");
+        }
+        let r3 = conn.query_with_params("SELECT count(*) FROM t WHERE k = ?", &[SqliteValue::from("a")]).unwrap();
+        eprintln!("[DIAG] 3. count(*) bind WHERE: {:?}", r3.first().map(|r| r.values()));
+
+        // Also get EXPLAIN for the working non-aggregate version
+        let explain4 = conn.prepare("SELECT k FROM t WHERE k = ?")
+            .map(|s| s.explain())
+            .unwrap_or_else(|e| format!("PREPARE ERROR: {e}"));
+        for line in explain4.lines() {
+            eprintln!("[DIAG] 4.E| {line}");
+        }
+        if explain4.is_empty() {
+            eprintln!("[DIAG] 4.E| (empty)");
+        }
+
+        // 4: select with bind WHERE (no aggregate)
+        let r4 = conn.query_with_params("SELECT k FROM t WHERE k = ?", &[SqliteValue::from("a")]).unwrap();
+        eprintln!("[DIAG] 4. select k bind WHERE: {:?}", r4.first().map(|r| r.values()));
+
+        // 5: count(k) with bind WHERE
+        let r5 = conn.query_with_params("SELECT count(k) FROM t WHERE k = ?", &[SqliteValue::from("a")]).unwrap();
+        eprintln!("[DIAG] 5. count(k) bind WHERE: {:?}", r5.first().map(|r| r.values()));
+
+        // 6: count with bind WHERE but no match
+        let r6 = conn.query_with_params("SELECT count(*) FROM t WHERE k = ?", &[SqliteValue::from("nonexistent")]).unwrap();
+        eprintln!("[DIAG] 6. count(*) bind WHERE no match: {:?}", r6.first().map(|r| r.values()));
+
+        let c = r3.first().and_then(|r| r.values().first()).and_then(SqliteValue::as_integer).unwrap_or(-99);
+        assert_eq!(c, 1, "count(*) with bind param WHERE should return 1");
+    }
+
+    #[test]
+    fn test_diag_root_page_visibility() {
+        use fsqlite_types::value::SqliteValue;
+        // Create full beads schema and check which root pages are accessible
+        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+
+        // Apply schema step by step, checking after each table
+        let tables = vec![
+            ("issues", r"CREATE TABLE IF NOT EXISTS issues (
+                id TEXT PRIMARY KEY,
+                content_hash TEXT,
+                title TEXT NOT NULL CHECK(length(title) <= 500),
+                description TEXT NOT NULL DEFAULT '',
+                design TEXT NOT NULL DEFAULT '',
+                acceptance_criteria TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4),
+                issue_type TEXT NOT NULL DEFAULT 'task',
+                assignee TEXT,
+                owner TEXT DEFAULT '',
+                estimated_minutes INTEGER,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT '',
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                closed_at DATETIME,
+                close_reason TEXT DEFAULT '',
+                closed_by_session TEXT DEFAULT '',
+                due_at DATETIME,
+                defer_until DATETIME,
+                external_ref TEXT,
+                source_system TEXT DEFAULT '',
+                source_repo TEXT NOT NULL DEFAULT '.',
+                deleted_at DATETIME,
+                deleted_by TEXT DEFAULT '',
+                delete_reason TEXT DEFAULT '',
+                original_type TEXT DEFAULT '',
+                compaction_level INTEGER DEFAULT 0,
+                compacted_at DATETIME,
+                compacted_at_commit TEXT,
+                original_size INTEGER,
+                sender TEXT DEFAULT '',
+                ephemeral INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0,
+                is_template INTEGER DEFAULT 0,
+                CHECK (
+                    (status = 'closed' AND closed_at IS NOT NULL) OR
+                    (status = 'tombstone') OR
+                    (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL)
+                )
+            )"),
+        ];
+        for (name, sql) in &tables {
+            match conn.execute(sql) {
+                Ok(_) => eprintln!("[ROOT-DIAG] Created table {name} OK"),
+                Err(e) => eprintln!("[ROOT-DIAG] Failed to create table {name}: {e}"),
+            }
+        }
+
+        // Create first few indexes
+        let indexes = vec![
+            "CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_issue_type ON issues(issue_type)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee) WHERE assignee IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_issues_created_at ON issues(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_updated_at ON issues(updated_at)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_content_hash ON issues(content_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_issues_external_ref ON issues(external_ref) WHERE external_ref IS NOT NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_external_ref_unique ON issues(external_ref) WHERE external_ref IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_issues_ephemeral ON issues(ephemeral) WHERE ephemeral = 1",
+            "CREATE INDEX IF NOT EXISTS idx_issues_pinned ON issues(pinned) WHERE pinned = 1",
+            "CREATE INDEX IF NOT EXISTS idx_issues_tombstone ON issues(status) WHERE status = 'tombstone'",
+            "CREATE INDEX IF NOT EXISTS idx_issues_due_at ON issues(due_at) WHERE due_at IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_issues_defer_until ON issues(defer_until) WHERE defer_until IS NOT NULL",
+            "CREATE INDEX IF NOT EXISTS idx_issues_ready ON issues(status, priority, created_at) WHERE status IN ('open', 'in_progress') AND ephemeral = 0 AND pinned = 0 AND (is_template = 0 OR is_template IS NULL)",
+        ];
+        for (i, sql) in indexes.iter().enumerate() {
+            match conn.execute(sql) {
+                Ok(_) => eprintln!("[ROOT-DIAG] Created index {} OK", i + 1),
+                Err(e) => eprintln!("[ROOT-DIAG] Failed to create index {}: {e}", i + 1),
+            }
+        }
+
+        // Try count(*) first (simplest possible query)
+        match conn.query_with_params("SELECT count(*) FROM sqlite_master", &[]) {
+            Ok(rows) => {
+                let count = rows.first().and_then(|r| r.values().first())
+                    .and_then(SqliteValue::as_integer).unwrap_or(-99);
+                eprintln!("[ROOT-DIAG] count(*) from sqlite_master: {count}");
+            },
+            Err(e) => eprintln!("[ROOT-DIAG] count(*) FAILED: {e}"),
+        }
+
+        // Try SELECT without ORDER BY
+        match conn.query_with_params("SELECT type, name, rootpage FROM sqlite_master", &[]) {
+            Ok(rows) => {
+                eprintln!("[ROOT-DIAG] sqlite_master entries (no ORDER BY):");
+                for row in &rows {
+                    let vals = row.values();
+                    let typ = vals.get(0).map(|v| format!("{v:?}")).unwrap_or_default();
+                    let name = vals.get(1).map(|v| format!("{v:?}")).unwrap_or_default();
+                    let rootpage = vals.get(2).and_then(SqliteValue::as_integer).unwrap_or(0);
+                    eprintln!("[ROOT-DIAG]   type={typ} name={name} rootpage={rootpage}");
+                }
+            },
+            Err(e) => eprintln!("[ROOT-DIAG] SELECT (no ORDER BY) FAILED: {e}"),
+        }
+
+        // Try SELECT with ORDER BY
+        match conn.query_with_params("SELECT type, name, rootpage FROM sqlite_master ORDER BY rootpage", &[]) {
+            Ok(rows) => {
+                eprintln!("[ROOT-DIAG] sqlite_master entries (ORDER BY):");
+                for row in &rows {
+                    let vals = row.values();
+                    let rootpage = vals.get(2).and_then(SqliteValue::as_integer).unwrap_or(0);
+                    eprintln!("[ROOT-DIAG]   rootpage={rootpage}");
+                }
+            },
+            Err(e) => eprintln!("[ROOT-DIAG] SELECT (ORDER BY) FAILED: {e}"),
+        }
+
+        // Try simple SELECT from issues table
+        match conn.query_with_params("SELECT count(*) FROM issues", &[]) {
+            Ok(rows) => {
+                let count = rows.first().and_then(|r| r.values().first())
+                    .and_then(SqliteValue::as_integer).unwrap_or(-99);
+                eprintln!("[ROOT-DIAG] count(*) from issues: {count}");
+            },
+            Err(e) => eprintln!("[ROOT-DIAG] count(*) from issues FAILED: {e}"),
+        }
+
+        let mut max_rootpage = 0i64;
+
+        // Also try: incrementally create indexes and check count(*) after each
+        eprintln!("[ROOT-DIAG] --- Incremental index creation with count check ---");
+        let conn2 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        conn2.execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT)").unwrap();
+        for i in 1..=20 {
+            let col = ['a', 'b', 'c', 'd', 'e'][i % 5];
+            let sql = format!("CREATE INDEX IF NOT EXISTS idx_{i} ON t({col})");
+            match conn2.execute(&sql) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("[ROOT-DIAG] Index {i} creation FAILED: {e}");
+                    break;
+                }
+            }
+            match conn2.query_with_params("SELECT count(*) FROM sqlite_master", &[]) {
+                Ok(rows) => {
+                    let count = rows.first().and_then(|r| r.values().first())
+                        .and_then(SqliteValue::as_integer).unwrap_or(-99);
+                    eprintln!("[ROOT-DIAG] After {i} indexes: count(*)={count}");
+                },
+                Err(e) => {
+                    eprintln!("[ROOT-DIAG] After {i} indexes: count(*) FAILED: {e}");
+                    break;
+                }
+            }
+        }
+
+        // Test multi-insert with explicit transactions
+        eprintln!("[ROOT-DIAG] --- Multi-insert test ---");
+        let conn3 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        conn3.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)").unwrap();
+        for i in 0..5 {
+            conn3.execute("BEGIN IMMEDIATE").unwrap();
+            conn3.execute_with_params("INSERT INTO ev (msg) VALUES (?)", &[SqliteValue::from(format!("msg{i}"))]).unwrap();
+            conn3.execute("COMMIT").unwrap();
+        }
+        let rows3 = conn3.query_with_params("SELECT count(*) FROM ev", &[]).unwrap();
+        let count3 = rows3.first().and_then(|r| r.values().first()).and_then(SqliteValue::as_integer).unwrap_or(-99);
+        eprintln!("[ROOT-DIAG] Multi-insert count: {count3} (expected 5)");
+
+        let all3 = conn3.query_with_params("SELECT id, msg FROM ev", &[]).unwrap();
+        for row in &all3 {
+            let id = row.values().first().and_then(SqliteValue::as_integer).unwrap_or(-1);
+            let msg = row.values().get(1).map(|v| format!("{v:?}")).unwrap_or_default();
+            eprintln!("[ROOT-DIAG]   id={id} msg={msg}");
+        }
+
+        // Also test without explicit transactions (autocommit)
+        let conn4 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        conn4.execute("CREATE TABLE ev2 (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)").unwrap();
+        for i in 0..5 {
+            conn4.execute_with_params("INSERT INTO ev2 (msg) VALUES (?)", &[SqliteValue::from(format!("msg{i}"))]).unwrap();
+        }
+        let rows4 = conn4.query_with_params("SELECT count(*) FROM ev2", &[]).unwrap();
+        let count4 = rows4.first().and_then(|r| r.values().first()).and_then(SqliteValue::as_integer).unwrap_or(-99);
+        eprintln!("[ROOT-DIAG] Multi-insert (autocommit) count: {count4} (expected 5)");
+
+        let all4 = conn4.query_with_params("SELECT id, msg FROM ev2", &[]).unwrap();
+        for row in &all4 {
+            let id = row.values().first().and_then(SqliteValue::as_integer).unwrap_or(-1);
+            let msg = row.values().get(1).map(|v| format!("{v:?}")).unwrap_or_default();
+            eprintln!("[ROOT-DIAG]   id={id} msg={msg}");
+        }
+
+        // Test events-like table with indexes and WHERE+ORDER BY
+        eprintln!("[ROOT-DIAG] --- Events-like test ---");
+        let conn5 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        conn5.execute("CREATE TABLE issues2 (id TEXT PRIMARY KEY, title TEXT)").unwrap();
+        conn5.execute("CREATE TABLE ev3 (id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT NOT NULL, msg TEXT, created_at TEXT, FOREIGN KEY (issue_id) REFERENCES issues2(id))").unwrap();
+        conn5.execute("CREATE INDEX idx_ev3_issue ON ev3(issue_id)").unwrap();
+        conn5.execute("CREATE INDEX idx_ev3_created ON ev3(created_at)").unwrap();
+        conn5.execute("INSERT INTO issues2 (id, title) VALUES ('test-001', 'Test')").unwrap();
+
+        for i in 0..5 {
+            conn5.execute("BEGIN IMMEDIATE").unwrap();
+            conn5.execute_with_params(
+                "INSERT INTO ev3 (issue_id, msg, created_at) VALUES (?1, ?2, ?3)",
+                &[SqliteValue::from("test-001"), SqliteValue::from(format!("msg{i}")), SqliteValue::from(format!("2024-01-0{} 00:00:00", i+1))],
+            ).unwrap();
+            conn5.execute("COMMIT").unwrap();
+        }
+
+        // Test count
+        let ev_count = conn5.query_with_params("SELECT count(*) FROM ev3", &[]).unwrap();
+        let c = ev_count.first().and_then(|r| r.values().first()).and_then(SqliteValue::as_integer).unwrap_or(-99);
+        eprintln!("[ROOT-DIAG] ev3 count: {c}");
+
+        // Test WHERE with bind (no order) - uses index_eq path
+        let ev_where = conn5.query_with_params("SELECT id, msg FROM ev3 WHERE issue_id = ?1", &[SqliteValue::from("test-001")]).unwrap();
+        eprintln!("[ROOT-DIAG] ev3 WHERE bind: {} rows", ev_where.len());
+
+        // Test WHERE with literal (no bind) - uses full scan
+        let ev_literal = conn5.query_with_params("SELECT id, msg FROM ev3 WHERE issue_id = 'test-001'", &[]).unwrap();
+        eprintln!("[ROOT-DIAG] ev3 WHERE literal: {} rows", ev_literal.len());
+
+        // Test full scan (no WHERE)
+        let ev_all = conn5.query_with_params("SELECT id, msg FROM ev3", &[]).unwrap();
+        eprintln!("[ROOT-DIAG] ev3 ALL (no where): {} rows", ev_all.len());
+
+        // Test WHERE with ORDER BY
+        let ev_ordered = conn5.query_with_params("SELECT id, msg FROM ev3 WHERE issue_id = ?1 ORDER BY created_at DESC, id DESC", &[SqliteValue::from("test-001")]).unwrap();
+        eprintln!("[ROOT-DIAG] ev3 WHERE+ORDER: {} rows", ev_ordered.len());
+        for row in &ev_ordered {
+            let id = row.values().first().and_then(SqliteValue::as_integer).unwrap_or(-1);
+            let msg = row.values().get(1).map(|v| format!("{v:?}")).unwrap_or_default();
+            eprintln!("[ROOT-DIAG]   id={id} msg={msg}");
+        }
+
+        assert!(max_rootpage == 0 || max_rootpage > 0, "diagnostic test completed");
+    }
+
+    #[test]
     fn test_get_issue_not_found_returns_none() {
         let storage = SqliteStorage::open_memory().unwrap();
 
