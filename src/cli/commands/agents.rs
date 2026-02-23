@@ -372,6 +372,12 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     // Default to check mode if no action specified
     let is_check = !args.add && !args.remove && !args.update;
 
+    // When --dry-run is passed without an explicit action, infer the action
+    // from the current state so the user sees what *would* happen.
+    if args.dry_run && is_check {
+        return execute_dry_run_inferred(&detection, &work_dir, ctx);
+    }
+
     if is_check || args.check {
         return execute_check(&detection, &work_dir, ctx);
     }
@@ -386,6 +392,98 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
 
     if args.update {
         return execute_update(&detection, args.dry_run, args.force, ctx);
+    }
+
+    Ok(())
+}
+
+/// Dry-run without an explicit action: infer what would happen and display it.
+#[allow(clippy::unnecessary_wraps)]
+fn execute_dry_run_inferred(
+    detection: &AgentFileDetection,
+    work_dir: &Path,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let is_rich = matches!(ctx.mode(), OutputMode::Rich);
+
+    if !detection.found() {
+        // No agent file exists -- would create AGENTS.md with blurb
+        let target_path = get_preferred_agent_file_path(work_dir);
+        if is_rich {
+            render_dry_run_add_rich(&target_path, ctx);
+            // Also show the blurb preview in rich mode
+            let console = Console::default();
+            let theme = ctx.theme();
+            let width = ctx.width();
+
+            let mut content = Text::new("");
+            content.append_styled("Preview of content that would be added:\n\n", theme.dimmed.clone());
+            // Show a truncated preview (first few lines)
+            for line in AGENT_BLURB.lines().take(12) {
+                content.append_styled(line, theme.dimmed.clone());
+                content.append("\n");
+            }
+            content.append_styled("  ... (", theme.dimmed.clone());
+            content.append_styled(
+                &format!("{} lines total", AGENT_BLURB.lines().count()),
+                theme.emphasis.clone(),
+            );
+            content.append_styled(")\n", theme.dimmed.clone());
+
+            let panel = Panel::from_rich_text(&content, width)
+                .title(Text::styled("Blurb Preview", theme.panel_title.clone()))
+                .box_style(theme.box_style);
+            console.print_renderable(&panel);
+        } else {
+            println!("Dry-run: would create {} with beads workflow instructions", target_path.display());
+            println!("\n--- Preview ---");
+            println!("{AGENT_BLURB}");
+        }
+        return Ok(());
+    }
+
+    if detection.needs_upgrade() {
+        // Would update existing blurb
+        let file_path = detection.file_path.as_ref().unwrap();
+        let from_version = if detection.has_legacy_blurb {
+            "bv (legacy)".to_string()
+        } else {
+            format!("v{}", detection.blurb_version)
+        };
+        if is_rich {
+            render_dry_run_update_rich(file_path, &from_version, ctx);
+        } else {
+            println!(
+                "Dry-run: would update beads workflow instructions from {from_version} to v{BLURB_VERSION}"
+            );
+            println!("File: {}", file_path.display());
+        }
+        return Ok(());
+    }
+
+    if detection.needs_blurb() {
+        // File exists but has no blurb -- would add
+        let file_path = detection.file_path.as_ref().unwrap();
+        if is_rich {
+            render_dry_run_add_rich(file_path, ctx);
+        } else {
+            println!(
+                "Dry-run: would add beads workflow instructions to {}",
+                file_path.display()
+            );
+            println!("\n--- Preview ---");
+            println!("{AGENT_BLURB}");
+        }
+        return Ok(());
+    }
+
+    // Already up to date -- nothing to do
+    if is_rich {
+        render_already_up_to_date_rich(ctx);
+    } else {
+        println!(
+            "Dry-run: no changes needed. Beads workflow instructions are up to date (v{BLURB_VERSION})."
+        );
     }
 
     Ok(())

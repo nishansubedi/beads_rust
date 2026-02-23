@@ -10,6 +10,7 @@ use self_update::backends::github;
 use self_update::cargo_crate_version;
 use self_update::update::ReleaseUpdate;
 use serde::Serialize;
+use std::env;
 
 /// Repo owner for GitHub releases.
 const REPO_OWNER: &str = "Dicklesworthstone";
@@ -237,6 +238,17 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     Ok(())
 }
 
+/// Resolve a GitHub auth token from environment variables.
+///
+/// Checks `GITHUB_TOKEN` first, then `GH_TOKEN`. Returns `None` if neither
+/// is set or if the value is empty.
+fn resolve_auth_token() -> Option<String> {
+    env::var("GITHUB_TOKEN")
+        .or_else(|_| env::var("GH_TOKEN"))
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
 /// Map the Rust target triple to the asset name fragment used in GitHub releases.
 ///
 /// Release assets follow the pattern `br-v{VERSION}-{platform}_{arch}.tar.gz`
@@ -256,16 +268,22 @@ fn asset_target_name() -> &'static str {
 /// Build the self-update updater.
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
     let public_key = *include_bytes!("../../release_public_key.bin");
-    github::Update::configure()
+    let mut builder = github::Update::configure();
+    builder
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(true)
         .current_version(current_version)
-        .verifying_keys(vec![public_key])
-        .build()
-        .map_err(map_update_error)
+        .verifying_keys(vec![public_key]);
+
+    if let Some(token) = resolve_auth_token() {
+        tracing::debug!("Using GitHub auth token from environment");
+        builder.auth_token(&token);
+    }
+
+    builder.build().map_err(map_update_error)
 }
 
 /// Build updater with a specific target version.
@@ -275,7 +293,8 @@ fn build_updater_with_target(
     show_progress: bool,
 ) -> Result<Box<dyn ReleaseUpdate>> {
     let public_key = *include_bytes!("../../release_public_key.bin");
-    github::Update::configure()
+    let mut builder = github::Update::configure();
+    builder
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
@@ -283,9 +302,14 @@ fn build_updater_with_target(
         .show_download_progress(show_progress)
         .current_version(current_version)
         .target_version_tag(target_version)
-        .verifying_keys(vec![public_key])
-        .build()
-        .map_err(map_update_error)
+        .verifying_keys(vec![public_key]);
+
+    if let Some(token) = resolve_auth_token() {
+        tracing::debug!("Using GitHub auth token from environment");
+        builder.auth_token(&token);
+    }
+
+    builder.build().map_err(map_update_error)
 }
 
 /// Map `self_update` errors to `BeadsError`.
