@@ -850,7 +850,7 @@ fn should_show_progress(json: bool, quiet: bool) -> bool {
 }
 
 /// Execute the --import-only operation.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_import(
     storage: &mut crate::storage::SqliteStorage,
     beads_dir: &std::path::Path,
@@ -956,10 +956,7 @@ fn execute_import(
     // rather than reading only from the DB, so that project config is respected.
     let layer = config::load_config(beads_dir, Some(storage), cli)?;
     let id_cfg = config::id_config_from_layer(&layer);
-    let prefix = if id_cfg.prefix != "bd" {
-        // Config layer resolved a non-default prefix — use it
-        id_cfg.prefix
-    } else {
+    let prefix = if id_cfg.prefix == "bd" {
         // Prefix is still the default — check if we should auto-detect from JSONL
         let db_prefix = storage.get_config("issue_prefix")?;
         if let Some(p) = db_prefix {
@@ -972,6 +969,9 @@ fn execute_import(
         } else {
             "bd".to_string()
         }
+    } else {
+        // Config layer resolved a non-default prefix — use it
+        id_cfg.prefix
     };
 
     // Execute import
