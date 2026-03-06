@@ -757,6 +757,41 @@ fn path_is_within_beads_dir(path: &Path, beads_dir: &Path) -> bool {
     effective_path.starts_with(beads_dir) || effective_path.starts_with(&canonical_beads)
 }
 
+/// Fast prefix inference: reads only the first issue from JSONL.
+/// Used by `load_config` on every command — must be O(1) not O(n).
+fn first_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
+    if !jsonl_path.is_file() {
+        return Ok(None);
+    }
+
+    let file = std::fs::File::open(jsonl_path)?;
+    let reader = std::io::BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some((prefix, _)) = id.split_once('-') else {
+            continue;
+        };
+        if !prefix.is_empty() {
+            return Ok(Some(prefix.to_string()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
     if !jsonl_path.is_file() {
         return Ok(None);
@@ -1131,12 +1166,14 @@ pub fn load_config(
 ) -> Result<ConfigLayer> {
     let defaults = default_config_layer();
 
-    // Infer issue prefix from existing JSONL so workspaces with non-"bd"
-    // prefixes don't silently fall back to "bd" when the DB layer is
-    // missing the stored prefix (e.g. after auto-rebuild).
+    // Infer issue prefix from the first issue in JSONL so workspaces with
+    // non-"bd" prefixes don't silently fall back to "bd" when the DB layer
+    // is missing the stored prefix (e.g. after auto-rebuild).
+    // Uses a fast single-line read (not full-file scan) since this runs on
+    // every command.
     let jsonl_path = beads_dir.join("issues.jsonl");
     let mut jsonl_inferred = ConfigLayer::default();
-    if let Some(prefix) = common_prefix_from_jsonl(&jsonl_path)? {
+    if let Some(prefix) = first_prefix_from_jsonl(&jsonl_path)? {
         jsonl_inferred
             .runtime
             .insert("issue_prefix".to_string(), prefix);

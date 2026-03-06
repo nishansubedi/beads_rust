@@ -885,10 +885,17 @@ impl SqliteStorage {
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? OR depends_on_id = ?",
-                &[SqliteValue::from(id), SqliteValue::from(id)],
+                "DELETE FROM dependencies WHERE issue_id = ?",
+                &[SqliteValue::from(id)],
             )?;
-            conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+            conn.execute_with_params(
+                "DELETE FROM dependencies WHERE depends_on_id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            conn.execute_with_params(
+                "DELETE FROM issues WHERE id = ?",
+                &[SqliteValue::from(id)],
+            )?;
 
             ctx.record_event(
                 EventType::Deleted,
