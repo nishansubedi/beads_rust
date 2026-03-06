@@ -400,7 +400,7 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `sync` | Sync DB ↔ JSONL | `br sync --flush-only` |
 | `doctor` | Run diagnostics | `br doctor` |
 | `stats` | Project statistics | `br stats` |
-| `config` | Manage config | `br config --list` |
+| `config` | Manage config | `br config list` |
 | `upgrade` | Self-update | `br upgrade` |
 | `version` | Show version | `br version` |
 
@@ -456,16 +456,16 @@ sync:
 
 ```bash
 # Show all config
-br config --list
+br config list
 
 # Get specific value
-br config --get id.prefix
+br config get id.prefix
 
 # Set value
-br config --set defaults.priority=1
+br config set defaults.priority=1
 
 # Open in editor
-br config --edit
+br config edit
 ```
 
 ### Environment Variables
@@ -569,7 +569,7 @@ br list | grep -i "abc"
 
 ```bash
 # Check your prefix
-br config --get id.prefix
+br config get id.prefix
 
 # Import with validation skip (careful!)
 br sync --import-only --skip-prefix-validation
@@ -718,7 +718,7 @@ br sync --import-only
 Yes:
 
 ```bash
-br config --set id.prefix=myproj
+br config set id.prefix=myproj
 # New issues: myproj-abc123
 ```
 
