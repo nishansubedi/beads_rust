@@ -268,7 +268,6 @@ fn asset_target_name() -> &'static str {
 
 /// Build the self-update updater.
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
-    let public_key = *include_bytes!("../../release_public_key.bin");
     let mut builder = github::Update::configure();
     builder
         .repo_owner(REPO_OWNER)
@@ -276,8 +275,8 @@ fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(true)
-        .current_version(current_version)
-        .verifying_keys(vec![public_key]);
+        .no_confirm(true)
+        .current_version(current_version);
 
     if let Some(token) = resolve_auth_token() {
         tracing::debug!("Using GitHub auth token from environment");
@@ -293,7 +292,6 @@ fn build_updater_with_target(
     current_version: &str,
     show_progress: bool,
 ) -> Result<Box<dyn ReleaseUpdate>> {
-    let public_key = *include_bytes!("../../release_public_key.bin");
     let mut builder = github::Update::configure();
     builder
         .repo_owner(REPO_OWNER)
@@ -301,9 +299,9 @@ fn build_updater_with_target(
         .bin_name(BIN_NAME)
         .target(asset_target_name())
         .show_download_progress(show_progress)
+        .no_confirm(true)
         .current_version(current_version)
-        .target_version_tag(target_version)
-        .verifying_keys(vec![public_key]);
+        .target_version_tag(target_version);
 
     if let Some(token) = resolve_auth_token() {
         tracing::debug!("Using GitHub auth token from environment");
