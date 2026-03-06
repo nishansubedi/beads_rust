@@ -1348,13 +1348,21 @@ pub fn export_to_jsonl_with_policy(
     for issue in &mut issues {
         if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.dependencies = deps.clone();
-        } else {
-            issue.dependencies.clear();
+        } else if all_deps.is_some() && !issue.dependencies.is_empty() {
+            // Bulk query succeeded but had no entry for this issue — possible
+            // partial read failure. Preserve existing deps to avoid silent data loss.
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk dependency query; preserving existing dependencies"
+            );
         }
         if let Some(labels) = all_labels.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.labels = labels.clone();
-        } else {
-            issue.labels.clear();
+        } else if all_labels.is_some() && !issue.labels.is_empty() {
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk label query; preserving existing labels"
+            );
         }
         // Normalize labels for consistent round-trip hashing (matches import behavior)
         if !issue.labels.is_empty() {
@@ -1363,8 +1371,11 @@ pub fn export_to_jsonl_with_policy(
         }
         if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.comments = comments.clone();
-        } else {
-            issue.comments.clear();
+        } else if all_comments.is_some() && !issue.comments.is_empty() {
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk comment query; preserving existing comments"
+            );
         }
     }
 
@@ -1577,13 +1588,21 @@ pub fn export_to_writer_with_policy<W: Write>(
     for issue in &mut issues {
         if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.dependencies = deps.clone();
-        } else {
-            issue.dependencies.clear();
+        } else if all_deps.is_some() && !issue.dependencies.is_empty() {
+            // Bulk query succeeded but had no entry for this issue — possible
+            // partial read failure. Preserve existing deps to avoid silent data loss.
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk dependency query; preserving existing dependencies"
+            );
         }
         if let Some(labels) = all_labels.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.labels = labels.clone();
-        } else {
-            issue.labels.clear();
+        } else if all_labels.is_some() && !issue.labels.is_empty() {
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk label query; preserving existing labels"
+            );
         }
         // Normalize labels for consistent round-trip hashing (matches import behavior)
         if !issue.labels.is_empty() {
@@ -1592,8 +1611,11 @@ pub fn export_to_writer_with_policy<W: Write>(
         }
         if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.comments = comments.clone();
-        } else {
-            issue.comments.clear();
+        } else if all_comments.is_some() && !issue.comments.is_empty() {
+            tracing::warn!(
+                issue_id = %issue.id,
+                "issue missing from bulk comment query; preserving existing comments"
+            );
         }
     }
 
