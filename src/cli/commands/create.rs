@@ -166,14 +166,26 @@ pub fn create_issue_impl(
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(config.id_config.clone());
         let count = storage.count_issues()?;
-        id_gen.generate(
+        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+        let generated_id = id_gen.generate(
             title,
             None, // description
             None, // creator
             now,
             count,
-            |id| storage.id_exists(id).unwrap_or(false),
-        )
+            |id| match storage.id_exists(id) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
+                    // Treat as "exists" to force retry with a different ID
+                    true
+                }
+            },
+        );
+        if let Some(err_msg) = id_check_err.into_inner() {
+            return Err(anyhow::anyhow!(err_msg).into());
+        }
+        generated_id
     };
 
     // 3. Parse fields
@@ -445,14 +457,24 @@ fn execute_import(
         }
 
         let count = storage.count_issues()?;
+        let id_check_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
         let id = id_gen.generate(
             &title,
             parsed.description.as_deref(),
             None,
             now,
             count,
-            |id| storage.id_exists(id).unwrap_or(false),
+            |id| match storage.id_exists(id) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    id_check_err.set(Some(format!("Failed to check ID existence: {e}")));
+                    true
+                }
+            },
         );
+        if let Some(err_msg) = id_check_err.into_inner() {
+            return Err(anyhow::anyhow!(err_msg).into());
+        }
 
         let priority = if let Some(ref p) = parsed.priority {
             match Priority::from_str(p) {
