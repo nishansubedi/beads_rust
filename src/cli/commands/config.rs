@@ -11,9 +11,9 @@
 
 use crate::cli::ConfigCommands;
 use crate::config::{
-    self, CliOverrides, ConfigLayer, ConfigPaths, default_config_layer, discover_beads_dir,
-    id_config_from_layer, load_legacy_user_config, load_project_config, load_user_config,
-    resolve_actor,
+    self, CliOverrides, ConfigLayer, ConfigPaths, default_config_layer,
+    discover_optional_beads_dir_with_cli, id_config_from_layer, load_legacy_user_config,
+    load_project_config, load_user_config, resolve_actor,
 };
 use crate::error::Result;
 use crate::output::OutputContext;
@@ -22,7 +22,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use tracing::{debug, info, trace};
 
@@ -86,10 +86,10 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     match command {
-        ConfigCommands::Path => show_paths(json_mode, ctx),
+        ConfigCommands::Path => show_paths(json_mode, overrides, ctx),
         ConfigCommands::Edit => edit_config(),
         ConfigCommands::List { project, user } => {
-            let beads_dir = discover_beads_dir(None).ok();
+            let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
             show_config(
                 beads_dir.as_ref(),
                 overrides,
@@ -99,10 +99,10 @@ pub fn execute(
                 ctx,
             )
         }
-        ConfigCommands::Set { args } => set_config_value(args, json_mode, ctx),
+        ConfigCommands::Set { args } => set_config_value(args, json_mode, overrides, ctx),
         ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides, ctx),
         ConfigCommands::Get { key } => {
-            let beads_dir = discover_beads_dir(None).ok();
+            let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
             get_config_value(key, beads_dir.as_ref(), overrides, json_mode, ctx)
         }
     }
@@ -260,12 +260,13 @@ fn render_kv_table(title: &str, rows: &[(String, String)], ctx: &OutputContext) 
     ctx.render(&table);
 }
 /// Show config file paths.
-fn show_paths(_json_mode: bool, ctx: &OutputContext) -> Result<()> {
-    let beads_dir = discover_beads_dir(Some(Path::new(".")))?;
-    let paths = ConfigPaths::resolve(&beads_dir, None)?;
+fn show_paths(_json_mode: bool, overrides: &CliOverrides, ctx: &OutputContext) -> Result<()> {
+    let paths = discover_optional_beads_dir_with_cli(overrides)?
+        .map(|beads_dir| ConfigPaths::resolve(&beads_dir, overrides.db.as_ref()))
+        .transpose()?;
     let user_config_path = get_user_config_path();
     let legacy_user_path = get_legacy_user_config_path();
-    let project_path = Some(paths.beads_dir.join("config.yaml"));
+    let project_path = paths.as_ref().and_then(ConfigPaths::project_config_path);
 
     if ctx.is_json() {
         let output = json!({
@@ -397,7 +398,12 @@ fn get_config_value(
 }
 
 /// Set a config value in project config (if available) or user config.
-fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> Result<()> {
+fn set_config_value(
+    args: &[String],
+    _json_mode: bool,
+    overrides: &CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let (key, value) = match args.len() {
         1 => args[0]
             .split_once('=')
@@ -415,14 +421,15 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
     };
 
     // Determine target config file
-    let (config_path, is_project) = if let Ok(beads_dir) = discover_beads_dir(None) {
-        (beads_dir.join("config.yaml"), true)
-    } else {
-        let path = get_user_config_path().ok_or_else(|| {
-            crate::error::BeadsError::Config("HOME environment variable not set".to_string())
-        })?;
-        (path, false)
-    };
+    let (config_path, is_project) =
+        if let Some(beads_dir) = discover_optional_beads_dir_with_cli(overrides)? {
+            (beads_dir.join("config.yaml"), true)
+        } else {
+            let path = get_user_config_path().ok_or_else(|| {
+                crate::error::BeadsError::Config("HOME environment variable not set".to_string())
+            })?;
+            (path, false)
+        };
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
@@ -581,7 +588,7 @@ fn delete_config_value(
     ctx: &OutputContext,
 ) -> Result<()> {
     // 1. Delete from DB
-    let beads_dir = discover_beads_dir(None).ok();
+    let beads_dir = discover_optional_beads_dir_with_cli(overrides)?;
     let mut db_deleted = false;
 
     if let Some(dir) = &beads_dir {
@@ -971,7 +978,7 @@ mod tests {
         // Test with empty HOME - will fail with proper error
         let args = vec!["no_equals_sign".to_string()];
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = set_config_value(&args, false, &ctx);
+        let result = set_config_value(&args, false, &CliOverrides::default(), &ctx);
         assert!(result.is_err());
     }
 

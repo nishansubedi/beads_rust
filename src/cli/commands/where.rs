@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct WhereOutput {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,8 +30,24 @@ struct WhereOutput {
 ///
 /// Returns an error if redirect resolution fails.
 pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let Ok(beads_dir) = config::discover_beads_dir(Some(Path::new("."))) else {
+    let Some(output) = resolve_where_output(cli)? else {
         return handle_missing_beads(ctx);
+    };
+
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
+    } else if ctx.is_rich() {
+        render_where_rich(&output, ctx);
+    } else {
+        print_human(&output);
+    }
+
+    Ok(())
+}
+
+fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput>> {
+    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
+        return Ok(None);
     };
 
     let final_dir = follow_redirects(&beads_dir, 10)?;
@@ -46,23 +62,13 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let jsonl_path = canonicalize_lossy(&paths.jsonl_path).display().to_string();
     let prefix = detect_prefix(&final_dir, &paths.jsonl_path, cli);
 
-    let output = WhereOutput {
+    Ok(Some(WhereOutput {
         path: canonicalize_lossy(&final_dir).display().to_string(),
         redirected_from,
         prefix,
         database_path: Some(database_path),
         jsonl_path: Some(jsonl_path),
-    };
-
-    if ctx.is_json() {
-        ctx.json_pretty(&output);
-    } else if ctx.is_rich() {
-        render_where_rich(&output, ctx);
-    } else {
-        print_human(&output);
-    }
-
-    Ok(())
+    }))
 }
 
 fn detect_prefix(
@@ -207,4 +213,58 @@ fn render_where_rich(output: &WhereOutput, ctx: &OutputContext) {
 
 fn canonicalize_lossy(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CliOverrides;
+    use crate::error::BeadsError;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_where_output_uses_explicit_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join("external").join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, r#"{"id":"proj-abc12","title":"Example"}"#).expect("write jsonl");
+
+        let cli = CliOverrides {
+            db: Some(db_path.clone()),
+            ..CliOverrides::default()
+        };
+
+        let output = resolve_where_output(&cli)
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(
+            output.path,
+            canonicalize_lossy(&beads_dir).display().to_string()
+        );
+        assert_eq!(
+            output.database_path,
+            Some(canonicalize_lossy(&db_path).display().to_string())
+        );
+        assert_eq!(
+            output.jsonl_path,
+            Some(canonicalize_lossy(&jsonl_path).display().to_string())
+        );
+        assert_eq!(output.prefix.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn resolve_where_output_surfaces_invalid_db_override() {
+        let cli = CliOverrides {
+            db: Some(PathBuf::from("/tmp/not-a-beads-db")),
+            ..CliOverrides::default()
+        };
+
+        let err = resolve_where_output(&cli).expect_err("invalid db override should error");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+    }
 }

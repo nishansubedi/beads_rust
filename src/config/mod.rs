@@ -257,6 +257,26 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
     )
 }
 
+/// Discover the active `.beads` directory, but allow "no workspace" when no
+/// explicit `--db` target was provided.
+///
+/// This is intended for commands that can operate outside a project and should
+/// only suppress `NotInitialized` when the user did not explicitly point to a
+/// database.
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - An explicit `--db` path is invalid
+/// - Discovery fails for reasons other than `NotInitialized`
+pub fn discover_optional_beads_dir_with_cli(cli: &CliOverrides) -> Result<Option<PathBuf>> {
+    match discover_beads_dir_with_cli(cli) {
+        Ok(path) => Ok(Some(path)),
+        Err(BeadsError::NotInitialized) if cli.db.is_none() => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Extract the `.beads/` directory from a database path.
 ///
 /// E.g., `/path/to/.beads/beads.db` → `/path/to/.beads/`
@@ -2020,6 +2040,34 @@ labels:
 
         let discovered = discover_beads_dir(Some(&nested)).expect("discover");
         assert_eq!(discovered, beads_dir);
+    }
+
+    #[test]
+    fn discover_optional_beads_dir_with_cli_uses_explicit_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join("external").join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let cli = CliOverrides {
+            db: Some(beads_dir.join("beads.db")),
+            ..CliOverrides::default()
+        };
+
+        let discovered =
+            discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with db");
+        assert_eq!(discovered, Some(beads_dir));
+    }
+
+    #[test]
+    fn discover_optional_beads_dir_with_cli_surfaces_invalid_db_override() {
+        let cli = CliOverrides {
+            db: Some(PathBuf::from("/tmp/not-a-beads-db")),
+            ..CliOverrides::default()
+        };
+
+        let err = discover_optional_beads_dir_with_cli(&cli)
+            .expect_err("invalid explicit db should error");
+        assert!(matches!(err, BeadsError::Validation { .. }));
     }
 
     #[test]

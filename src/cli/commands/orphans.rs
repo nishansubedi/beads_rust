@@ -36,8 +36,9 @@ pub struct OrphanIssue {
 ///
 /// # Errors
 ///
-/// Returns an error only for unexpected failures. Returns empty list
-/// (not error) when git/DB is unavailable.
+/// Returns an error for invalid explicit targets or storage failures.
+/// Returns an empty list when no workspace exists or when git metadata is
+/// unavailable in the current repository.
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &OrphansArgs,
@@ -45,17 +46,12 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    // Try to discover beads directory - return empty if not found
-    let Ok(beads_dir) = config::discover_beads_dir(None) else {
+    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
         output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
 
-    // Try to open storage - return empty if not found
-    let Ok(storage_ctx) = config::open_storage_with_cli(&beads_dir, cli) else {
-        output_empty(ctx.is_json() || args.robot, ctx);
-        return Ok(());
-    };
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
 
     // Get issue prefix from config

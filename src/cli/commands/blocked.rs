@@ -4,7 +4,7 @@
 
 use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic};
 use crate::config::{
-    CliOverrides, discover_beads_dir, external_project_db_paths, load_config,
+    CliOverrides, discover_beads_dir_with_cli, external_project_db_paths, load_config,
     open_storage_with_cli, should_use_color,
 };
 use crate::error::Result;
@@ -30,7 +30,7 @@ pub fn execute(
 ) -> Result<()> {
     tracing::info!("Fetching blocked issues from cache");
 
-    let beads_dir = discover_beads_dir(None)?;
+    let beads_dir = discover_beads_dir_with_cli(overrides)?;
     let storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
     let storage = &storage_ctx.storage;
 

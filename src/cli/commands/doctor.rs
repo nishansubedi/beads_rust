@@ -876,7 +876,7 @@ fn check_sync_metadata(
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let mut checks = Vec::new();
-    let Ok(beads_dir) = config::discover_beads_dir(None) else {
+    let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
         push_check(
             &mut checks,
             "beads_dir",
