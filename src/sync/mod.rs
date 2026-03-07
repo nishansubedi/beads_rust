@@ -4057,11 +4057,9 @@ mod tests {
         let config = ExportConfig::default();
         let result = export_to_jsonl(&storage, &output_path, &config).unwrap();
 
-        storage
-            .execute_test_sql("DROP TABLE export_hashes")
-            .unwrap();
+        let invalid_issue_hashes = vec![("bd-missing".to_string(), "hash".to_string())];
 
-        let err = finalize_export(&mut storage, &result, Some(&result.issue_hashes)).unwrap_err();
+        let err = finalize_export(&mut storage, &result, Some(&invalid_issue_hashes)).unwrap_err();
         match err {
             BeadsError::Database(_) => {}
             other => panic!("unexpected error: {other:?}"),
@@ -4071,6 +4069,7 @@ mod tests {
             storage.get_dirty_issue_ids().unwrap(),
             vec!["bd-finalize".to_string()]
         );
+        assert!(storage.get_export_hash("bd-finalize").unwrap().is_none());
         assert!(
             storage
                 .get_metadata(METADATA_JSONL_CONTENT_HASH)
