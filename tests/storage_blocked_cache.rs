@@ -711,3 +711,78 @@ fn deep_parent_child_chain_blocking() {
     assert!(!ids.contains(&p3.id), "p3 unblocked");
     assert!(!ids.contains(&leaf.id), "leaf unblocked");
 }
+
+// ===========================================================================
+// 16. Regression: >50 parent-child levels must propagate correctly (#154)
+// ===========================================================================
+
+/// Before the fix for issue #154, transitive blocked-cache propagation was
+/// capped at `MAX_DEPTH = 50`, causing descendants beyond that depth to
+/// silently appear as "ready" even though an ancestor was blocked.
+///
+/// This test builds a chain of 75 parent-child levels to verify that
+/// propagation reaches every descendant.
+#[test]
+fn deep_chain_beyond_50_levels_blocks_all_descendants() {
+    let mut storage = test_db();
+
+    const CHAIN_LEN: usize = 75;
+
+    // Create the blocker issue that will block the root of the chain
+    let blocker = fixtures::issue("deep75-blocker");
+    storage.create_issue(&blocker, "tester").unwrap();
+
+    // Build a chain of CHAIN_LEN issues: node-0 -> node-1 -> ... -> node-(CHAIN_LEN-1)
+    let mut chain_issues: Vec<beads_rust::model::Issue> = Vec::with_capacity(CHAIN_LEN);
+    for i in 0..CHAIN_LEN {
+        let issue = fixtures::issue(&format!("deep75-node-{i}"));
+        storage.create_issue(&issue, "tester").unwrap();
+        chain_issues.push(issue);
+    }
+
+    // blocker blocks node-0
+    storage
+        .add_dependency(
+            &chain_issues[0].id,
+            &blocker.id,
+            DependencyType::Blocks.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    // node-1 is child of node-0, node-2 is child of node-1, etc.
+    for i in 1..CHAIN_LEN {
+        storage
+            .add_dependency(
+                &chain_issues[i].id,
+                &chain_issues[i - 1].id,
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+    }
+
+    // Every issue in the chain should be blocked
+    let ids = blocked_ids(&storage);
+    for (i, issue) in chain_issues.iter().enumerate() {
+        assert!(
+            ids.contains(&issue.id),
+            "node-{i} (depth {depth}) should be blocked but was not found in blocked list \
+             (old MAX_DEPTH=50 bug if depth > 50)",
+            depth = i + 1,
+        );
+    }
+
+    // Close the blocker → entire chain should unblock
+    storage
+        .update_issue(&blocker.id, &status_update(Status::Closed), "tester")
+        .unwrap();
+
+    let ids = blocked_ids(&storage);
+    for (i, issue) in chain_issues.iter().enumerate() {
+        assert!(
+            !ids.contains(&issue.id),
+            "node-{i} should be unblocked after closing blocker",
+        );
+    }
+}
