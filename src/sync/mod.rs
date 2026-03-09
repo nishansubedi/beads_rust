@@ -2344,10 +2344,13 @@ pub fn import_from_jsonl(
         if config.rename_on_import && !mismatches.is_empty() {
             use crate::util::id::{IdConfig, IdGenerator};
 
+            let mismatch_set: std::collections::HashSet<String> =
+                mismatches.iter().cloned().collect();
+
             // Collect details to avoid borrowing issues during generation
             let to_rename: Vec<_> = issues
                 .iter()
-                .filter(|i| mismatches.contains(&i.id))
+                .filter(|i| mismatch_set.contains(&i.id))
                 .map(|i| {
                     (
                         i.id.clone(),
@@ -2364,6 +2367,18 @@ pub fn import_from_jsonl(
             let existing_ids: std::collections::HashSet<String> =
                 storage.get_all_ids()?.into_iter().collect();
 
+            // Collect all IDs that will NOT be renamed to avoid collisions
+            let mut occupied_ids: std::collections::HashSet<String> = issues
+                .iter()
+                .filter(|i| !mismatch_set.contains(&i.id))
+                .map(|i| i.id.clone())
+                .collect();
+
+            // Add existing IDs from storage to occupied set
+            occupied_ids.extend(existing_ids);
+
+            let mut generated_ids = std::collections::HashSet::new();
+
             for (old_id, title, desc, creator, created_at) in to_rename {
                 let new_id = generator.generate(
                     &title,
@@ -2372,11 +2387,10 @@ pub fn import_from_jsonl(
                     created_at,
                     issues.len(),
                     |candidate| {
-                        existing_ids.contains(candidate)
-                            || issues.iter().any(|i| i.id == candidate)
-                            || renames.values().any(|v| *v == candidate)
+                        occupied_ids.contains(candidate) || generated_ids.contains(candidate)
                     },
                 );
+                generated_ids.insert(new_id.clone());
                 renames.insert(old_id, new_id);
             }
 
@@ -2548,7 +2562,9 @@ pub fn import_from_jsonl(
             let mut orphans_cleaned = 0usize;
             for (table, col) in orphan_tables {
                 let sql = if *table == "dependencies" && *col == "depends_on_id" {
-                    format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'")
+                    format!(
+                        "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues) AND {col} NOT LIKE 'external:%'"
+                    )
                 } else {
                     format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)")
                 };
@@ -2622,7 +2638,8 @@ pub fn import_from_jsonl(
 }
 
 fn id_matches_expected_prefix(id: &str, expected_prefix: &str) -> bool {
-    parse_id(id).is_ok_and(|parsed| parsed.prefix == expected_prefix)
+    let normalized_prefix = expected_prefix.trim_end_matches('-');
+    parse_id(id).is_ok_and(|parsed| parsed.prefix == normalized_prefix)
 }
 
 /// Process a single import action.
