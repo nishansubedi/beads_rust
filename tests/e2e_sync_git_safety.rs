@@ -652,6 +652,18 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         return true;
     }
 
+    if filename.ends_with(".jsonl.tmp") {
+        return true;
+    }
+    if let Some(prefix) = filename.strip_suffix(".tmp")
+        && let Some((base, pid)) = prefix.rsplit_once(".jsonl.")
+        && !base.is_empty()
+        && !pid.is_empty()
+        && pid.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
     // Check extension matches
     const ALLOWED_EXTENSIONS: &[&str] = &[
         "db",         // SQLite database

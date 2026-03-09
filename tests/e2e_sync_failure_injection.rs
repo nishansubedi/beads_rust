@@ -40,6 +40,10 @@ struct FailureTestArtifacts {
     snapshots: Vec<(String, BTreeMap<String, String>)>,
 }
 
+fn export_temp_path_for_test(output_path: &Path) -> PathBuf {
+    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+}
+
 impl FailureTestArtifacts {
     fn new(test_name: &str) -> Self {
         let artifact_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -223,8 +227,8 @@ fn export_failure_temp_file_preserves_original() {
     artifacts.log("initial_hash", &initial_hash);
     artifacts.snapshot_dir("before", temp.path());
 
-    // Create a directory named issues.jsonl.tmp to block temp file creation
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    // Create the exact temp path used by export to block temp file creation.
+    let temp_path = export_temp_path_for_test(&jsonl_path);
     fs::create_dir_all(&temp_path).unwrap();
 
     // Attempt export
@@ -655,7 +659,7 @@ fn export_cleans_up_temp_file_on_success() {
     let beads_dir = temp.path().join(".beads");
     fs::create_dir_all(&beads_dir).unwrap();
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    let temp_path = export_temp_path_for_test(&jsonl_path);
 
     // Export should succeed
     let config = ExportConfig {
@@ -748,7 +752,7 @@ fn atomic_write_pipeline_produces_valid_output() {
     let beads_dir = temp.path().join(".beads");
     fs::create_dir_all(&beads_dir).unwrap();
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    let temp_path = export_temp_path_for_test(&jsonl_path);
 
     // Export
     let config = ExportConfig {
@@ -808,7 +812,7 @@ fn stale_temp_file_handled_gracefully() {
     let beads_dir = temp.path().join(".beads");
     fs::create_dir_all(&beads_dir).unwrap();
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    let temp_path = export_temp_path_for_test(&jsonl_path);
 
     // Create a stale temp file (simulating previous failed export)
     let stale_content = r#"{"id":"stale-001","title":"Stale from crash"}"#;

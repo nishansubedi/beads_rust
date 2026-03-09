@@ -816,6 +816,25 @@ fn e2e_list_limit() {
 }
 
 #[test]
+fn e2e_list_limit_with_label_filter() {
+    let _log = common::test_log("e2e_list_limit_with_label_filter");
+    let (workspace, _ids) = setup_diverse_workspace();
+
+    let list = run_br(
+        &workspace,
+        ["list", "--label", "core", "--limit", "1", "--json"],
+        "list_limit_label",
+    );
+    assert!(list.status.success());
+
+    let payload = extract_json_payload(&list.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
+
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["title"], "Core task");
+}
+
+#[test]
 fn e2e_list_limit_zero_unlimited() {
     let _log = common::test_log("e2e_list_limit_zero_unlimited");
     let (workspace, _ids) = setup_diverse_workspace();

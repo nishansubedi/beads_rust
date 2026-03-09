@@ -41,6 +41,10 @@ fn create_test_issue(id: &str, title: &str) -> Issue {
     issue
 }
 
+fn export_temp_path_for_test(output_path: &Path) -> std::path::PathBuf {
+    output_path.with_extension(format!("jsonl.{}.tmp", std::process::id()))
+}
+
 fn setup_storage_with_issues(count: usize) -> SqliteStorage {
     let mut storage = SqliteStorage::open_memory().unwrap();
     for i in 0..count {
@@ -223,7 +227,7 @@ fn temp_file_cleaned_up_on_failure() {
     let temp = TempDir::new().unwrap();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    let temp_path = export_temp_path_for_test(&jsonl_path);
 
     // Create initial JSONL
     fs::write(&jsonl_path, r#"{"id":"old","title":"Old"}"#).unwrap();
@@ -416,7 +420,7 @@ fn export_rejects_existing_temp_symlink_and_preserves_live_jsonl() {
     let temp = TempDir::new().unwrap();
     let beads_dir = setup_beads_dir(&temp);
     let jsonl_path = beads_dir.join("issues.jsonl");
-    let temp_path = beads_dir.join("issues.jsonl.tmp");
+    let temp_path = export_temp_path_for_test(&jsonl_path);
     fs::write(&jsonl_path, "{\"id\":\"old\",\"title\":\"Old\"}\n").unwrap();
 
     let outside = TempDir::new().unwrap();
