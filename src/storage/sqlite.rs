@@ -4344,6 +4344,8 @@ fn query_external_project_capabilities(
         }
     }
 
+    // Explicitly close the connection to avoid fsqlite drop_close warnings.
+    let _ = conn.close();
     Ok(satisfied)
 }
 
@@ -4998,6 +5000,8 @@ impl Drop for SqliteStorage {
     fn drop(&mut self) {
         // Final WAL checkpoint on close to flush all data to the main DB file.
         self.try_wal_checkpoint();
+        // Explicitly close the connection to avoid fsqlite drop_close warnings.
+        let _ = self.conn.close_in_place();
     }
 }
 
