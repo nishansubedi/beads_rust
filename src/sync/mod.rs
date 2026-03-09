@@ -2210,6 +2210,13 @@ fn normalize_issue(issue: &mut Issue) {
             issue.external_ref = Some(ext_ref.trim().to_string());
         }
     }
+
+    // Repair timestamps invariant: updated_at cannot be before created_at.
+    // In distributed systems, clocks can be out of sync; we enforce the invariant
+    // locally to keep the database consistent.
+    if issue.updated_at < issue.created_at {
+        issue.updated_at = issue.created_at;
+    }
 }
 
 /// Import issues from a JSONL file.
