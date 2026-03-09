@@ -2176,6 +2176,39 @@ fn normalize_issue(issue: &mut Issue) {
         issue.labels.dedup();
     }
 
+    // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
+    // keep only the most recent entry by created_at. This handles duplicate parent-child
+    // entries from reparenting or migration artifacts (see issue #159).
+    if issue.dependencies.len() > 1 {
+        use std::collections::HashMap;
+        // Build a map keyed by (issue_id, depends_on_id, dep_type), keeping the entry
+        // with the latest created_at for each triple.
+        let mut best: HashMap<(String, String, String), usize> = HashMap::new();
+        for (i, dep) in issue.dependencies.iter().enumerate() {
+            let key = (
+                dep.issue_id.clone(),
+                dep.depends_on_id.clone(),
+                dep.dep_type.as_str().to_string(),
+            );
+            match best.get(&key) {
+                Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
+                    // existing entry is newer or equal, skip
+                }
+                _ => {
+                    best.insert(key, i);
+                }
+            }
+        }
+        if best.len() < issue.dependencies.len() {
+            let mut keep_indices: Vec<usize> = best.into_values().collect();
+            keep_indices.sort_unstable();
+            issue.dependencies = keep_indices
+                .into_iter()
+                .map(|i| issue.dependencies[i].clone())
+                .collect();
+        }
+    }
+
     // Recompute content hash
     issue.content_hash = Some(content_hash(issue));
 

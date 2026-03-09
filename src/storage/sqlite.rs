@@ -2989,7 +2989,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_parent_id(&self, issue_id: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child'",
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ? AND type = 'parent-child' ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
