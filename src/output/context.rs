@@ -227,57 +227,64 @@ impl OutputContext {
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if serialization fails (e.g., non-string map keys, recursive structures).
+    fn report_serialization_error(&self, format: &str, err: &serde_json::Error) {
+        if !self.is_quiet() {
+            eprintln!("Error: failed to serialize {format} output: {err}");
+        }
+    }
+
+    fn json_value<T: serde::Serialize>(
+        &self,
+        value: &T,
+        format: &str,
+    ) -> Option<serde_json::Value> {
+        match serde_json::to_value(value) {
+            Ok(json_value) => Some(json_value),
+            Err(err) => {
+                self.report_serialization_error(format, &err);
+                None
+            }
+        }
+    }
+
     pub fn json<T: serde::Serialize>(&self, value: &T) {
         if self.is_json() {
             // Stream to stdout to avoid allocating large JSON strings.
             let stdout = io::stdout();
             let mut out = io::BufWriter::new(stdout.lock());
             if let Err(err) = serde_json::to_writer(&mut out, value) {
-                assert!(
-                    err.is_io(),
-                    "JSON serialization failed - value is not serializable"
-                );
+                self.report_serialization_error("JSON", &err);
+                return;
             }
             let _ = out.write_all(b"\n");
         }
     }
 
-    /// # Panics
-    ///
-    /// Panics if serialization fails (e.g., non-string map keys, recursive structures).
     pub fn json_pretty<T: serde::Serialize>(&self, value: &T) {
         if self.is_rich() {
-            let json = rich_rust::renderables::Json::new(
-                serde_json::to_value(value)
-                    .expect("JSON conversion failed - value is not serializable"),
-            );
+            let Some(json_value) = self.json_value(value, "JSON") else {
+                return;
+            };
+            let json = rich_rust::renderables::Json::new(json_value);
             self.console().print_renderable(&json);
         } else if self.is_json() {
             // Stream to stdout to avoid allocating large JSON strings.
             let stdout = io::stdout();
             let mut out = io::BufWriter::new(stdout.lock());
             if let Err(err) = serde_json::to_writer_pretty(&mut out, value) {
-                assert!(
-                    err.is_io(),
-                    "JSON serialization failed - value is not serializable"
-                );
+                self.report_serialization_error("JSON", &err);
+                return;
             }
             let _ = out.write_all(b"\n");
         }
     }
 
     /// Output value as TOON format (token-optimized object notation).
-    ///
-    /// # Panics
-    ///
-    /// Panics if serialization to JSON fails.
     pub fn toon<T: serde::Serialize>(&self, value: &T) {
         if self.is_toon() {
-            let json_value = serde_json::to_value(value)
-                .expect("JSON conversion failed - value is not serializable");
+            let Some(json_value) = self.json_value(value, "TOON") else {
+                return;
+            };
             let toon_value: JsonValue = json_value.into();
             let options = Some(EncodeOptions {
                 indent: Some(2),
@@ -295,28 +302,23 @@ impl OutputContext {
         show_stats || env_enabled
     }
 
-    fn pretty_json_len(value: &serde_json::Value) -> usize {
+    fn pretty_json_len(value: &serde_json::Value) -> Option<usize> {
         let mut writer = CountingWriter::default();
         let mut serializer = serde_json::Serializer::pretty(&mut writer);
-        value
-            .serialize(&mut serializer)
-            .expect("JSON serialization failed");
-        writer.len()
+        value.serialize(&mut serializer).ok()?;
+        Some(writer.len())
     }
 
     /// Output value as TOON format with optional stats on stderr.
-    ///
-    /// # Panics
-    ///
-    /// Panics if serialization to JSON fails.
     pub fn toon_with_stats<T: serde::Serialize>(&self, value: &T, show_stats: bool) {
         if self.is_toon() {
-            let json_value = serde_json::to_value(value)
-                .expect("JSON conversion failed - value is not serializable");
+            let Some(json_value) = self.json_value(value, "TOON") else {
+                return;
+            };
             let emit_stats =
                 Self::should_emit_toon_stats(show_stats, std::env::var("TOON_STATS").is_ok());
             let json_chars = if emit_stats {
-                Some(Self::pretty_json_len(&json_value))
+                Self::pretty_json_len(&json_value)
             } else {
                 None
             };
@@ -330,8 +332,7 @@ impl OutputContext {
             });
             let toon_output = encode(toon_value, options);
 
-            if emit_stats {
-                let json_chars = json_chars.expect("stats must compute JSON length");
+            if let Some(json_chars) = json_chars {
                 let toon_chars = toon_output.len();
                 let savings = if json_chars > 0 {
                     let diff = json_chars.saturating_sub(toon_chars);
@@ -443,7 +444,20 @@ impl OutputContext {
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde::Serialize;
+    use serde::ser::Error as _;
     use serde_json::json;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("boom"))
+        }
+    }
 
     #[test]
     fn detect_mode_uses_env_json_default_when_no_explicit_format_requested() {
@@ -506,9 +520,17 @@ mod tests {
 
         assert_eq!(
             OutputContext::pretty_json_len(&value),
-            serde_json::to_string_pretty(&value)
-                .expect("JSON serialization failed")
-                .len()
+            Some(
+                serde_json::to_string_pretty(&value)
+                    .expect("JSON serialization failed")
+                    .len()
+            )
         );
+    }
+
+    #[test]
+    fn json_value_returns_none_on_serialize_error() {
+        let ctx = OutputContext::from_output_format(OutputFormat::Json, false, true);
+        assert!(ctx.json_value(&FailingSerialize, "JSON").is_none());
     }
 }
