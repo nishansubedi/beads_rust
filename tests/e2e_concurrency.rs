@@ -10,6 +10,7 @@
 mod common;
 
 use assert_cmd::Command;
+use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -302,6 +303,91 @@ fn e2e_concurrent_reads_succeed() {
     }
 
     drop(temp_dir);
+}
+
+/// Test that parallel read-only commands do not contend on teardown.
+///
+/// This specifically guards against hidden write-like work during command
+/// shutdown, such as opportunistic WAL checkpoints from otherwise read-only
+/// operations.
+#[test]
+fn e2e_parallel_read_only_commands_do_not_busy_on_drop() {
+    let _log = common::test_log("e2e_parallel_read_only_commands_do_not_busy_on_drop");
+
+    let registry = DatasetRegistry::new();
+    if !registry.is_available(KnownDataset::BeadsRust) {
+        eprintln!("skipping: beads_rust dataset is unavailable in this environment");
+        return;
+    }
+
+    let isolated =
+        IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("copy beads_rust dataset");
+    let root = isolated.root.clone();
+
+    let create = run_br_in_dir(
+        &root,
+        ["--no-auto-import", "--no-auto-flush", "create", "Concurrency seed issue"],
+    );
+    assert!(create.success, "seed create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let root_arc = Arc::new(root);
+    let barrier = Arc::new(Barrier::new(6));
+    let mut handles = Vec::new();
+
+    for worker in 0..6 {
+        let root_clone = Arc::clone(&root_arc);
+        let barrier_clone = Arc::clone(&barrier);
+        let issue_id_clone = issue_id.clone();
+
+        handles.push(thread::spawn(move || {
+            barrier_clone.wait();
+
+            let mut failures = Vec::new();
+            for iteration in 0..6 {
+                let result = if worker % 2 == 0 {
+                    run_br_in_dir(
+                        &root_clone,
+                        ["--lock-timeout", "1", "--no-auto-import", "--no-auto-flush", "ready", "--json"],
+                    )
+                } else {
+                    run_br_in_dir(
+                        &root_clone,
+                        [
+                            "--lock-timeout",
+                            "1",
+                            "--no-auto-import",
+                            "--no-auto-flush",
+                            "show",
+                            &issue_id_clone,
+                            "--json",
+                        ],
+                    )
+                };
+
+                if !result.success {
+                    failures.push(format!(
+                        "iteration={iteration} stdout={} stderr={}",
+                        result.stdout, result.stderr
+                    ));
+                    break;
+                }
+            }
+
+            (worker, failures)
+        }));
+    }
+
+    for handle in handles {
+        let (worker, failures) = handle.join().expect("thread panicked");
+        assert!(
+            failures.is_empty(),
+            "worker {worker} hit read-only contention: {}",
+            failures.join(" | ")
+        );
+    }
+
+    drop(isolated);
 }
 
 /// Test that lock timeout is properly respected with specific timing.

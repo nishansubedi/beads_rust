@@ -10,8 +10,9 @@ use crate::error::Result;
 use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
-use crate::storage::{ReadyFilters, ReadySortPolicy};
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
 use unicode_width::UnicodeWidthStr;
@@ -28,13 +29,47 @@ pub fn execute(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
 ) -> Result<()> {
-    // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let config_layer = storage_ctx.load_config(cli)?;
-    let storage = &storage_ctx.storage;
+    execute_inner(args, cli, outer_ctx, &beads_dir, None)
+}
 
-    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+/// Execute ready using storage that was already opened by the caller.
+///
+/// # Errors
+///
+/// Returns an error if configuration loading or the ready query fails.
+pub fn execute_with_storage(
+    args: &ReadyArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    storage: &SqliteStorage,
+) -> Result<()> {
+    execute_inner(args, cli, outer_ctx, beads_dir, Some(storage))
+}
+
+fn execute_inner(
+    args: &ReadyArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+) -> Result<()> {
+    let owned_storage_ctx = if preloaded_storage.is_some() {
+        None
+    } else {
+        Some(config::open_storage_with_cli(beads_dir, cli)?)
+    };
+    let storage = preloaded_storage
+        .or_else(|| owned_storage_ctx.as_ref().map(|ctx| &ctx.storage))
+        .expect("ready should have an open storage handle");
+    let config_layer = if let Some(storage_ctx) = owned_storage_ctx.as_ref() {
+        storage_ctx.load_config(cli)?
+    } else {
+        config::load_config(beads_dir, Some(storage), cli)?
+    };
+
+    let external_db_paths = config::external_project_db_paths(&config_layer, beads_dir);
     let use_color = config::should_use_color(&config_layer);
     let max_width = if std::io::stdout().is_terminal() {
         Some(terminal_width())

@@ -493,6 +493,31 @@ fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) 
             .all(|column| column_exists(conn, table, column))
 }
 
+fn current_schema_version_declared(conn: &Connection) -> bool {
+    conn.query_row("PRAGMA user_version")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
+}
+
+fn core_runtime_tables_exist(conn: &Connection) -> bool {
+    [
+        "issues",
+        "dependencies",
+        "labels",
+        "comments",
+        "events",
+        "config",
+        "metadata",
+        "dirty_issues",
+        "export_hashes",
+        "blocked_issues_cache",
+        "child_counters",
+    ]
+    .iter()
+    .all(|table| table_exists(conn, table))
+}
+
 /// Expected column order for the issues table (id + ISSUE_COLUMNS names).
 /// Used to detect when ALTER TABLE has appended columns in the wrong position,
 /// which causes fsqlite to fail with "no such column" errors on older databases.
@@ -560,6 +585,28 @@ fn issues_column_order_matches(conn: &Connection) -> bool {
         .iter()
         .zip(EXPECTED_ISSUE_COLUMN_ORDER.iter())
         .all(|(actual, expected)| actual == expected)
+}
+
+fn issues_filter_columns_require_v3_rebuild(conn: &Connection) -> bool {
+    let Ok(rows) = conn.query("PRAGMA table_info('issues')") else {
+        return true;
+    };
+
+    for column in ["ephemeral", "pinned", "is_template"] {
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
+        else {
+            return true;
+        };
+
+        let not_null = row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0);
+        if not_null == 0 {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Rebuild the issues table so columns match the canonical SCHEMA_SQL order.
@@ -796,6 +843,10 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
 }
 
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
+    if current_schema_version_declared(conn) && core_runtime_tables_exist(conn) {
+        return true;
+    }
+
     let issues_ok = issues_column_order_matches(conn);
     let dependencies_ok = table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
         && DEPENDENCY_COLUMNS
@@ -902,7 +953,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .and_then(SqliteValue::as_integer)
         .unwrap_or(0);
 
-    if user_version < 3 && table_exists(conn, "issues") {
+    if user_version < 3 && table_exists(conn, "issues") && issues_filter_columns_require_v3_rebuild(conn) {
         tracing::info!("Migrating database to schema version 3 (NOT NULL filter columns)");
         // 1. Backfill NULL values
         conn.execute("UPDATE issues SET ephemeral = 0 WHERE ephemeral IS NULL")?;

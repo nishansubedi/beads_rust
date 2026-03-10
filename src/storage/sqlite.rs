@@ -4,7 +4,6 @@ use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
-#[cfg(test)]
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
     apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
@@ -15,6 +14,7 @@ use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
@@ -124,7 +124,11 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        if runtime_schema_compatible(&conn) {
+        if database_header_user_version(path)
+            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
+        {
+            crate::storage::schema::apply_runtime_pragmas(&conn)?;
+        } else if runtime_schema_compatible(&conn) {
             apply_runtime_compatible_schema(&conn)?;
         } else {
             apply_schema(&conn)?;
@@ -4172,6 +4176,23 @@ impl SqliteStorage {
     }
 }
 
+fn database_header_user_version(path: &Path) -> Option<u32> {
+    if path == Path::new(":memory:") || !path.is_file() {
+        return None;
+    }
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut header = [0_u8; 100];
+    file.read_exact(&mut header).ok()?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return None;
+    }
+
+    Some(u32::from_be_bytes([
+        header[60], header[61], header[62], header[63],
+    ]))
+}
+
 /// Filter options for listing issues.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -5188,8 +5209,9 @@ fn dedupe_preserving_order(values: &[String]) -> Vec<String> {
 
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
-        // Final WAL checkpoint on close to flush all data to the main DB file.
-        self.try_wal_checkpoint();
+        // Do not checkpoint on drop. Read-only CLI commands were turning
+        // teardown into a write-like operation, which created spurious busy
+        // failures under parallel read traffic.
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
     }
@@ -6474,6 +6496,22 @@ mod tests {
         let _storage = SqliteStorage::open(&db_path).unwrap();
 
         assert!(db_path.exists(), "Database file should be created");
+    }
+
+    #[test]
+    fn test_database_header_user_version_reads_file_header_value() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("header_user_version.db");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            database_header_user_version(&db_path),
+            Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap())
+        );
     }
 
     #[test]
