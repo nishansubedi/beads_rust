@@ -3,11 +3,11 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
-use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic_with_outer_mode};
+use crate::cli::{resolve_output_format_basic_with_outer_mode, OutputFormat, StatsArgs};
 use crate::config;
 use crate::error::Result;
 use crate::format::{
-    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
+    truncate_title, Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary,
 };
 use crate::model::{Issue, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
@@ -152,7 +152,9 @@ impl ActivityCounts {
                     return;
                 }
 
-                if before.status == Status::Closed && after.status != Status::Closed {
+                if before.status == Status::Closed
+                    && !matches!(after.status, Status::Closed | Status::Tombstone)
+                {
                     self.issues_reopened += 1;
                     return;
                 }
@@ -1087,9 +1089,9 @@ mod tests {
 
     #[test]
     fn test_truncate_title_multibyte() {
-        // Multi-byte characters should not cause panics
-        let emoji = "😊".repeat(10); // 10 chars, 20 visual width
-        // truncate to 5 visual width
+        // Multi-byte characters should not cause panics.
+        // 10 chars, 20 visual width; truncate to 5 visual width.
+        let emoji = "😊".repeat(10);
         let result = truncate_title(&emoji, 5);
         assert!(result.ends_with("..."));
         // 5 visual width: "😊" (2) + "..." (3) = 5
@@ -1202,6 +1204,23 @@ mod tests {
         assert_eq!(activity.issues_closed, 1);
         assert_eq!(activity.issues_reopened, 1);
         assert_eq!(activity.total_changes, 4);
+    }
+
+    #[test]
+    fn test_activity_counts_tombstone_transition_as_update_not_reopen() {
+        let mut before = make_issue("bd-closed", Status::Closed, IssueType::Task);
+        before.closed_at = Some(Utc::now());
+
+        let mut after = before.clone();
+        after.status = Status::Tombstone;
+        after.deleted_at = Some(Utc::now());
+        after.delete_reason = Some("purged".to_string());
+
+        let mut counts = ActivityCounts::default();
+        counts.record_transition(Some(&before), Some(&after));
+
+        assert_eq!(counts.issues_reopened, 0);
+        assert_eq!(counts.issues_updated, 1);
     }
 
     #[test]
