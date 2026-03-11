@@ -110,11 +110,15 @@ impl HashFieldWriter {
     }
 
     fn field(&mut self, value: &str) {
-        if value.contains('\0') {
-            self.hasher.update(value.replace('\0', " ").as_bytes());
-        } else {
-            self.hasher.update(value.as_bytes());
+        let mut last_idx = 0;
+        for (i, b) in value.bytes().enumerate() {
+            if b == b'\0' {
+                self.hasher.update(&value.as_bytes()[last_idx..i]);
+                self.hasher.update(b" ");
+                last_idx = i + 1;
+            }
         }
+        self.hasher.update(&value.as_bytes()[last_idx..]);
         self.hasher.update(b"\x00");
     }
 
