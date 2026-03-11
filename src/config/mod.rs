@@ -206,16 +206,12 @@ fn discover_beads_dir_with_env(
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(path) = env_override {
-        if path.is_dir() {
-            return routing::follow_redirects(path, 10);
-        }
+        return resolve_explicit_beads_dir(path, "beads directory override");
     } else if let Ok(value) = env::var("BEADS_DIR")
         && !value.trim().is_empty()
     {
         let path = PathBuf::from(value);
-        if path.is_dir() {
-            return routing::follow_redirects(&path, 10);
-        }
+        return resolve_explicit_beads_dir(&path, "BEADS_DIR");
     }
 
     let mut current = match start {
@@ -284,7 +280,10 @@ fn discover_beads_dir_with_cli_from(
     if let Some(db_path) = cli.db.as_deref()
         && let Ok(beads_dir) = derive_beads_dir_from_db_path(db_path)
     {
-        return Ok(beads_dir);
+        return resolve_explicit_beads_dir(
+            &beads_dir,
+            &format!("database override '{}'", db_path.display()),
+        );
     }
 
     discover_beads_dir_with_env(start, env_override).map_err(|err| match (err, cli.db.as_deref())
@@ -312,6 +311,20 @@ fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
                 db_path.display()
             ),
         )
+    })
+}
+
+fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
+    if !path.is_dir() {
+        return Err(BeadsError::Config(format!(
+            "{source} must point to an existing .beads directory: {}",
+            path.display()
+        )));
+    }
+
+    routing::follow_redirects(path, 10).map_err(|err| BeadsError::WithContext {
+        context: format!("{source} is invalid"),
+        source: Box::new(err),
     })
 }
 
@@ -819,9 +832,13 @@ impl OpenStorageResult {
 
     /// Flush JSONL if no-db mode is enabled and there are dirty issues.
     ///
+    /// Before exporting, re-reads the on-disk JSONL to merge any changes made
+    /// by concurrent `--no-db` processes since this instance loaded its snapshot.
+    /// This prevents silently clobbering writes from other processes.
+    ///
     /// # Errors
     ///
-    /// Returns an error if JSONL export fails.
+    /// Returns an error if JSONL re-import or export fails.
     pub fn flush_no_db_if_dirty(&mut self) -> Result<()> {
         if !self.no_db {
             return Ok(());
@@ -829,6 +846,38 @@ impl OpenStorageResult {
 
         if self.storage.get_dirty_issue_count()? == 0 {
             return Ok(());
+        }
+
+        // Re-read the on-disk JSONL to merge concurrent writes before exporting.
+        // Without this, our export would overwrite the entire file with only the
+        // snapshot loaded at startup + our modifications, silently dropping any
+        // issues written by other --no-db processes in the interim.
+        if self.paths.jsonl_path.is_file() {
+            let prefix = self.storage.get_config("issue_prefix")?.unwrap_or_default();
+            let import_config = ImportConfig {
+                beads_dir: Some(self.paths.beads_dir.clone()),
+                allow_external_jsonl: resolved_jsonl_path_is_external(
+                    &self.paths.beads_dir,
+                    &self.paths.jsonl_path,
+                ),
+                show_progress: false,
+                ..Default::default()
+            };
+            // Errors during re-import are logged but non-fatal: we still want to
+            // flush our own dirty changes even if the JSONL is transiently
+            // unreadable (e.g. mid-rename by another process).
+            if let Err(err) = import_from_jsonl(
+                &mut self.storage,
+                &self.paths.jsonl_path,
+                &import_config,
+                Some(&prefix),
+            ) {
+                tracing::warn!(
+                    path = %self.paths.jsonl_path.display(),
+                    error = %err,
+                    "Failed to re-read JSONL before flush; proceeding with stale snapshot"
+                );
+            }
         }
 
         let export_config = ExportConfig {
@@ -849,6 +898,7 @@ impl OpenStorageResult {
             &mut self.storage,
             &export_result,
             Some(&export_result.issue_hashes),
+            &self.paths.jsonl_path,
         )?;
 
         Ok(())
@@ -2356,6 +2406,41 @@ labels:
         let discovered =
             discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with db");
         assert_eq!(discovered, Some(beads_dir));
+    }
+
+    #[test]
+    fn discover_optional_beads_dir_with_cli_follows_redirect_for_explicit_db_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_beads = temp.path().join("source").join(".beads");
+        let target_beads = temp.path().join("target").join(".beads");
+        fs::create_dir_all(&source_beads).expect("create source beads dir");
+        fs::create_dir_all(&target_beads).expect("create target beads dir");
+        fs::write(source_beads.join("redirect"), "../../target/.beads").expect("write redirect");
+
+        let cli = CliOverrides {
+            db: Some(source_beads.join("beads.db")),
+            ..CliOverrides::default()
+        };
+
+        let discovered =
+            discover_optional_beads_dir_with_cli(&cli).expect("optional discovery with redirect");
+        assert_eq!(discovered, Some(target_beads));
+    }
+
+    #[test]
+    fn discover_beads_dir_with_env_override_rejects_invalid_path_even_when_workspace_exists() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let invalid = temp.path().join("missing").join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let err = discover_beads_dir_with_env(Some(temp.path()), Some(&invalid))
+            .expect_err("invalid override should fail");
+        assert!(matches!(err, BeadsError::Config(_)));
+        assert!(
+            err.to_string().contains("existing .beads directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
