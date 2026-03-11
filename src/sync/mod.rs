@@ -1516,6 +1516,7 @@ pub fn export_to_jsonl_with_policy(
     let mut exported_ids = Vec::new();
     let mut skipped_tombstone_ids = Vec::new();
     let mut issue_hashes = Vec::new();
+    let mut buffer = Vec::new();
 
     for issue in &issues {
         // Skip expired tombstones
@@ -1525,20 +1526,8 @@ pub fn export_to_jsonl_with_policy(
             continue;
         }
 
-        let json = match serde_json::to_string(issue) {
-            Ok(json) => json,
-            Err(err) => {
-                ctx.handle_error(ExportError::new(
-                    ExportEntityType::Issue,
-                    issue.id.clone(),
-                    err.to_string(),
-                ))?;
-                progress.inc(1);
-                continue;
-            }
-        };
-
-        if let Err(err) = writeln!(writer, "{json}") {
+        buffer.clear();
+        if let Err(err) = serde_json::to_writer(&mut buffer, issue) {
             ctx.handle_error(ExportError::new(
                 ExportEntityType::Issue,
                 issue.id.clone(),
@@ -1548,7 +1537,17 @@ pub fn export_to_jsonl_with_policy(
             continue;
         }
 
-        hasher.update(json.as_bytes());
+        if let Err(err) = writer.write_all(&buffer).and_then(|_| writer.write_all(b"\n")) {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Issue,
+                issue.id.clone(),
+                err.to_string(),
+            ))?;
+            progress.inc(1);
+            continue;
+        }
+
+        hasher.update(&buffer);
         hasher.update(b"\n");
 
         exported_ids.push(issue.id.clone());
@@ -3524,11 +3523,14 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
     let mut ordered_issues: Vec<_> = issues.values().collect();
     ordered_issues.sort_by(|left, right| left.id.cmp(&right.id));
 
+    let mut buffer = Vec::new();
     for issue in ordered_issues {
-        let json = serde_json::to_string(issue).map_err(|e| {
+        buffer.clear();
+        serde_json::to_writer(&mut buffer, issue).map_err(|e| {
             BeadsError::Config(format!("Failed to serialize issue {}: {}", issue.id, e))
         })?;
-        writeln!(writer, "{json}")?;
+        writer.write_all(&buffer).map_err(|e| BeadsError::Io(e))?;
+        writer.write_all(b"\n").map_err(|e| BeadsError::Io(e))?;
     }
     writer.flush()?;
     writer
