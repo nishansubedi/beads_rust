@@ -137,7 +137,14 @@ opt-level = 1
 
 [features]
 default = ["self_update"]
-self_update = ["dep:self_update"]
+self_update = [
+    "dep:self_update",
+    "self_update/rustls",
+    "self_update/archive-tar",
+    "self_update/archive-zip",
+    "self_update/compression-flate2",
+    "self_update/compression-zip-deflate",
+]
 
 # Override crates.io fsqlite with a known-good Git revision that includes the
 # pure-Rust UnixVfs work. Tracking `main` directly made builds nondeterministic

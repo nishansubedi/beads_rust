@@ -270,14 +270,11 @@ impl BeadsError {
 
     /// Get the exit code for this error.
     ///
-    /// Legacy bd typically uses exit code 1 for most errors.
-    /// `NothingToDo` uses exit code 3 (issue errors category).
+    /// Delegates to [`ErrorCode::exit_code()`] via [`StructuredError`] for
+    /// consistent, categorized exit codes (1–8).
     #[must_use]
-    pub const fn exit_code(&self) -> i32 {
-        match self {
-            Self::NothingToDo { .. } => 3,
-            _ => 1,
-        }
+    pub fn exit_code(&self) -> i32 {
+        StructuredError::from_error(self).code.exit_code()
     }
 
     /// Create a validation error for a specific field.

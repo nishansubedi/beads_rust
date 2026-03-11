@@ -961,9 +961,9 @@ mod tests {
     }
 
     #[test]
-    fn test_status_from_str_invalid() {
-        let result = Status::from_str("invalid_status");
-        assert!(result.is_err());
+    fn test_status_from_str_unknown_becomes_custom() {
+        let result = Status::from_str("invalid_status").unwrap();
+        assert_eq!(result, Status::Custom("invalid_status".to_string()));
     }
 
     #[test]

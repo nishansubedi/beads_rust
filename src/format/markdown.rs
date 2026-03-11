@@ -141,8 +141,32 @@ fn try_skip_formatting(chars: &[char], i: usize, processed: &mut String) -> Opti
 
     // Bold/italic markers
     if c == '*' || c == '_' {
+        // Check for double markers (always strip)
+        let is_double = i + 1 < chars.len() && chars[i + 1] == c;
+
+        if !is_double {
+            // Don't strip single underscore if it's intra-word (e.g., snake_case)
+            if c == '_' && i > 0 && i + 1 < chars.len() {
+                let prev = chars[i - 1];
+                let next = chars[i + 1];
+                if prev.is_alphanumeric() && next.is_alphanumeric() {
+                    return None;
+                }
+            }
+
+            // Don't strip single asterisk if surrounded by spaces (e.g., math or bullet)
+            if c == '*' {
+                let prev_space = i == 0 || chars[i - 1].is_whitespace();
+                let next_space = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
+                if prev_space && next_space {
+                    return None;
+                }
+            }
+        }
+
         let mut j = i;
-        while j < chars.len() && (chars[j] == '*' || chars[j] == '_') {
+        // Skip all identical contiguous markers
+        while j < chars.len() && chars[j] == c {
             j += 1;
         }
         return Some(j);
@@ -414,6 +438,21 @@ mod tests {
         assert_eq!(strip_markdown("__bold__"), "bold");
         assert_eq!(strip_markdown("_italic_"), "italic");
         assert_eq!(strip_markdown("~~strikethrough~~"), "strikethrough");
+    }
+
+    #[test]
+    fn test_strip_markdown_preserves_snake_case() {
+        assert_eq!(strip_markdown("my_variable_name"), "my_variable_name");
+        assert_eq!(
+            strip_markdown("some_function(with_args)"),
+            "some_function(with_args)"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_preserves_math_asterisks() {
+        assert_eq!(strip_markdown("2 * 3 = 6"), "2 * 3 = 6");
+        assert_eq!(strip_markdown("pointer *p"), "pointer *p");
     }
 
     #[test]

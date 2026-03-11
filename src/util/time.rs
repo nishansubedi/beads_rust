@@ -207,8 +207,10 @@ pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
         );
     }
 
-    let months = days / 30;
-    if months < 12 {
+    if days < 365 {
+        #[allow(clippy::cast_possible_truncation)]
+        let months = (days as f64 / 30.44).round() as i64;
+        let months = months.max(1);
         return format!(
             "{} month{} {}",
             months,
@@ -218,6 +220,7 @@ pub fn format_relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 
     let years = days / 365;
+    let years = years.max(1);
     format!(
         "{} year{} {}",
         years,

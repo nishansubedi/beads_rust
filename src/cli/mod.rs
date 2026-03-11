@@ -1745,7 +1745,7 @@ pub struct CommentAddArgs {
     #[arg(short = 'f', long = "file")]
     pub file: Option<PathBuf>,
 
-    /// Override author (defaults to actor/env/git)
+    /// Override author (defaults to actor/env/user)
     #[arg(long)]
     pub author: Option<String>,
 

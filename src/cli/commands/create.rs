@@ -562,9 +562,9 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
-    let all_ids = storage.get_all_ids()?;
+    let mut all_ids = storage.get_all_ids()?;
 
-    for parsed in parsed_issues {
+    'outer: for parsed in parsed_issues {
         let title = parsed.title.trim().to_string();
         if title.is_empty() {
             eprintln!("✗ Failed to create issue: title cannot be empty");
@@ -748,7 +748,7 @@ fn execute_import(
 
             if let Some(message) = dependency_error {
                 eprintln!("✗ Failed to create {title}: {message}");
-                break;
+                continue 'outer;
             }
 
             match storage.create_issue(&issue, &actor) {
@@ -780,6 +780,7 @@ fn execute_import(
         // Increment count for next ID generation in the loop
         count += 1;
         last_created_id = Some(id.clone());
+        all_ids.push(id.clone());
         created_ids.push((id, title));
     }
 

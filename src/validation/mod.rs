@@ -74,6 +74,32 @@ impl IssueValidator {
             ));
         }
 
+        // Estimated minutes: Optional, must be non-negative and reasonable.
+        if let Some(minutes) = issue.estimated_minutes {
+            if minutes < 0 {
+                errors.push(ValidationError::new(
+                    "estimated_minutes",
+                    "cannot be negative",
+                ));
+            } else if minutes > 525_960 {
+                // ~1 year in minutes
+                errors.push(ValidationError::new(
+                    "estimated_minutes",
+                    "exceeds maximum (525960 minutes / ~1 year)",
+                ));
+            }
+        }
+
+        // Closed timestamps: closed_at must not precede created_at.
+        if let Some(closed_at) = issue.closed_at
+            && closed_at < issue.created_at
+        {
+            errors.push(ValidationError::new(
+                "closed_at",
+                "cannot be before created_at",
+            ));
+        }
+
         // External reference: Optional, max 200 chars, no whitespace.
         if let Some(external_ref) = issue.external_ref.as_ref() {
             if external_ref.len() > 200 {
