@@ -1871,7 +1871,14 @@ fn e2e_routing_update_claim_failure_does_not_mutate_earlier_routes() {
 
     let claim_external = run_br(
         &external_workspace,
-        ["--actor", "bob", "update", &external_id, "--claim", "--json"],
+        [
+            "--actor",
+            "bob",
+            "update",
+            &external_id,
+            "--claim",
+            "--json",
+        ],
         "claim_external_issue_bob",
     );
     assert!(

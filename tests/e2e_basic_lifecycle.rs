@@ -159,8 +159,8 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
         "first create failed: {}",
         create_first.stderr
     );
-    let first_issue: Value =
-        serde_json::from_str(&extract_json_payload(&create_first.stdout)).expect("first create json");
+    let first_issue: Value = serde_json::from_str(&extract_json_payload(&create_first.stdout))
+        .expect("first create json");
     let first_id = first_issue["id"]
         .as_str()
         .expect("first issue id")
@@ -197,13 +197,7 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
     let claim_both = run_br(
         &workspace,
         [
-            "--actor",
-            "alice",
-            "update",
-            &first_id,
-            &second_id,
-            "--claim",
-            "--json",
+            "--actor", "alice", "update", &first_id, &second_id, "--claim", "--json",
         ],
         "claim_multiple_ids_atomic",
     );
@@ -237,8 +231,8 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
         "show second failed: {}",
         show_second.stderr
     );
-    let second_after: Vec<Value> = serde_json::from_str(&extract_json_payload(&show_second.stdout))
-        .expect("show second json");
+    let second_after: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show_second.stdout)).expect("show second json");
     assert_eq!(second_after[0]["status"].as_str(), Some("in_progress"));
     assert_eq!(second_after[0]["assignee"].as_str(), Some("bob"));
 }
