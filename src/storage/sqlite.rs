@@ -521,6 +521,24 @@ impl SqliteStorage {
                 });
             }
 
+            // Check for external_ref collision
+            if let Some(ref ext_ref) = issue.external_ref {
+                let existing_ext = conn.query_with_params(
+                    "SELECT id FROM issues WHERE external_ref = ?",
+                    &[SqliteValue::from(ext_ref.as_str())],
+                )?;
+                if !existing_ext.is_empty() {
+                    let other_id = existing_ext[0]
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or_default()
+                        .to_string();
+                    return Err(BeadsError::Config(format!(
+                        "External reference '{ext_ref}' already exists on issue {other_id}"
+                    )));
+                }
+            }
+
             let status_str = issue.status.as_str();
             let issue_type_str = issue.issue_type.as_str();
             let created_at_str = issue.created_at.to_rfc3339();
@@ -942,6 +960,24 @@ impl SqliteStorage {
                 );
             }
             if let Some(ref val) = updates.external_ref {
+                // Explicit uniqueness check for fsqlite
+                if let Some(ref ext_ref) = val {
+                    let existing_ext = conn.query_with_params(
+                        "SELECT id FROM issues WHERE external_ref = ? AND id != ?",
+                        &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
+                    )?;
+                    if !existing_ext.is_empty() {
+                        let other_id = existing_ext[0]
+                            .get(0)
+                            .and_then(SqliteValue::as_text)
+                            .unwrap_or_default()
+                            .to_string();
+                        return Err(BeadsError::Config(format!(
+                            "External reference '{ext_ref}' already exists on issue {other_id}"
+                        )));
+                    }
+                }
+
                 issue.external_ref.clone_from(val);
                 add_update(
                     "external_ref",
@@ -1959,14 +1995,7 @@ impl SqliteStorage {
         Ok(count)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
-        // Safety bound: propagation converges when no new issues are found
-        // (the loop breaks on `newly_blocked.is_empty()`).  This limit only
-        // guards against pathological cycles that would otherwise spin forever.
-        // If hit, we FAIL LOUDLY rather than silently returning partial results.
-        const MAX_DEPTH: i32 = 10_000;
-
         // Clear existing cache
         conn.execute("DELETE FROM blocked_issues_cache")?;
 
@@ -2019,66 +2048,6 @@ impl SqliteStorage {
                 ],
             )?;
             count += 1;
-        }
-
-        // Now handle transitive blocking via parent-child relationships
-        let mut depth = 0;
-        loop {
-            if depth >= MAX_DEPTH {
-                return Err(crate::error::BeadsError::Other(anyhow::anyhow!(
-                    "Transitive blocked-cache propagation did not converge after {} iterations — \
-                     possible cycle in parent-child dependencies",
-                    MAX_DEPTH
-                )));
-            }
-
-            let newly_blocked: Vec<(String, String)> = {
-                let rows = conn.query(
-                    r"SELECT DISTINCT d.issue_id, d.depends_on_id
-                      FROM dependencies d
-                      INNER JOIN blocked_issues_cache bc ON d.depends_on_id = bc.issue_id
-                      WHERE d.type = 'parent-child'
-                        AND d.issue_id NOT IN (SELECT issue_id FROM blocked_issues_cache)",
-                )?;
-
-                rows.iter()
-                    .filter_map(|row| {
-                        let id = row.get(0).and_then(SqliteValue::as_text)?.to_string();
-                        let parent = row.get(1).and_then(SqliteValue::as_text)?.to_string();
-                        Some((id, parent))
-                    })
-                    .collect()
-            };
-
-            if newly_blocked.is_empty() {
-                break;
-            }
-
-            let mut issue_blockers: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (issue_id, parent_id) in newly_blocked {
-                issue_blockers.entry(issue_id).or_default().push(parent_id);
-            }
-
-            for (issue_id, parents) in issue_blockers {
-                let blockers: Vec<String> = parents
-                    .into_iter()
-                    .map(|p| format!("{p}:parent-blocked"))
-                    .collect();
-                let blockers_json =
-                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-
-                conn.execute_with_params(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(blockers_json),
-                    ],
-                )?;
-                count += 1;
-            }
-
-            depth += 1;
         }
 
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");

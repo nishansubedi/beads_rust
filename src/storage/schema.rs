@@ -933,18 +933,29 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
     if !has_blocked_by || !has_blocked_at || !has_issue_id {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
-        conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
-        conn.execute(
-            "CREATE TABLE blocked_issues_cache (
-                issue_id TEXT PRIMARY KEY,
-                blocked_by TEXT NOT NULL,
-                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            )",
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at)",
-        )?;
+        // Wrap in transaction so concurrent opens don't see a partially migrated state
+        conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
+            conn.execute(
+                "CREATE TABLE blocked_issues_cache (
+                    issue_id TEXT PRIMARY KEY,
+                    blocked_by TEXT NOT NULL,
+                    blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_blocked_cache_blocked_at ON blocked_issues_cache(blocked_at)",
+            )?;
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            let _ = conn.execute("ROLLBACK");
+            return Err(e);
+        }
+        conn.execute("COMMIT")?;
     }
 
     // Migration: ensure compaction_level is never NULL (bd compatibility)
