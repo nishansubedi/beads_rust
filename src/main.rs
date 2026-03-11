@@ -428,7 +428,7 @@ fn should_render_errors_as_json_with_env(
         || command_requests_robot_json(&cli.command)
         || matches!(
             command_requested_output_format(&cli.command).or(env_output_format),
-            Some(OutputFormat::Json)
+            Some(OutputFormat::Json | OutputFormat::Toon)
         )
 }
 
@@ -620,11 +620,26 @@ mod tests {
     }
 
     #[test]
+    fn should_render_errors_as_json_when_command_requests_toon_format() {
+        let cli = Cli::parse_from(["br", "list", "--format", "toon"]);
+        assert!(should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
     fn should_render_errors_as_json_when_env_requests_json_format() {
         let cli = Cli::parse_from(["br", "history", "list"]);
         assert!(should_render_errors_as_json_with_env(
             &cli,
             Some(OutputFormat::Json)
+        ));
+    }
+
+    #[test]
+    fn should_render_errors_as_json_when_env_requests_toon_format() {
+        let cli = Cli::parse_from(["br", "history", "list"]);
+        assert!(should_render_errors_as_json_with_env(
+            &cli,
+            Some(OutputFormat::Toon)
         ));
     }
 
