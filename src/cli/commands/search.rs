@@ -370,8 +370,21 @@ fn apply_client_filters(
     let now = Utc::now();
     let min_priority = args.priority_min.map(i32::from);
     let max_priority = args.priority_max.map(i32::from);
-    let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
-    let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
+
+    // Use Regex for efficient case-insensitive search without full description allocations
+    let desc_regex = args.desc_contains.as_deref().and_then(|needle| {
+        RegexBuilder::new(&regex::escape(needle))
+            .case_insensitive(true)
+            .build()
+            .ok()
+    });
+    let notes_regex = args.notes_contains.as_deref().and_then(|needle| {
+        RegexBuilder::new(&regex::escape(needle))
+            .case_insensitive(true)
+            .build()
+            .ok()
+    });
+
     // Deferred issues are included by default when no status filter is specified
     let include_deferred = args.deferred
         || args.status.is_empty()
@@ -409,16 +422,16 @@ fn apply_client_filters(
             continue;
         }
 
-        if let Some(ref needle) = desc_needle {
-            let haystack = issue.description.as_deref().unwrap_or("").to_lowercase();
-            if !haystack.contains(needle) {
+        if let Some(ref re) = desc_regex {
+            let haystack = issue.description.as_deref().unwrap_or("");
+            if !re.is_match(haystack) {
                 continue;
             }
         }
 
-        if let Some(ref needle) = notes_needle {
-            let haystack = issue.notes.as_deref().unwrap_or("").to_lowercase();
-            if !haystack.contains(needle) {
+        if let Some(ref re) = notes_regex {
+            let haystack = issue.notes.as_deref().unwrap_or("");
+            if !re.is_match(haystack) {
                 continue;
             }
         }

@@ -274,8 +274,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
 
     let closed_at = match &status {
         Some(Status::Closed | Status::Tombstone) => Some(Some(Utc::now())),
-        Some(Status::Open | Status::InProgress) => Some(None),
-        _ => None,
+        Some(_) => Some(None),
+        None => None,
     };
 
     // Build update struct
@@ -540,6 +540,15 @@ mod tests {
         assert_eq!(update.status, Some(Status::Closed));
         // closed_at should be set
         assert!(update.closed_at.is_some());
+
+        let args_blocked = UpdateArgs {
+            status: Some("blocked".to_string()),
+            ..Default::default()
+        };
+        let update_blocked = build_update(&args_blocked, "test_actor", false).unwrap();
+        assert_eq!(update_blocked.status, Some(Status::Blocked));
+        // closed_at should be explicitly cleared for non-terminal statuses
+        assert_eq!(update_blocked.closed_at, Some(None));
         info!("test_build_update_with_status: assertions passed");
     }
 

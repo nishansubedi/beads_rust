@@ -444,6 +444,7 @@ fn append_entry(beads_dir: &Path, entry: &mut AuditEntry) -> Result<String> {
         .open(&path)?;
 
     file.write_all(&line)?;
+    file.sync_all()?;
 
     Ok(entry.id.as_ref().expect("id set before append").clone())
 }

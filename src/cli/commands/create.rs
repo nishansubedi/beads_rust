@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdGenerator, IdResolver, child_id};
+use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
@@ -155,7 +155,7 @@ pub fn create_issue_impl(
 
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
-    let id_resolver = IdResolver::new(config.id_config.prefix.clone(), true);
+    let id_resolver = IdResolver::new(ResolverConfig::with_prefix(config.id_config.prefix.clone()));
     let resolved_parent = args
         .parent
         .as_deref()
@@ -421,7 +421,7 @@ fn populate_relations(
     storage: &crate::storage::SqliteStorage,
     prefix: &str,
 ) {
-    let resolver = IdResolver::new(prefix.to_string(), true);
+    let resolver = IdResolver::new(ResolverConfig::with_prefix(prefix.to_string()));
 
     // Labels
     for label in &args.labels {
@@ -663,7 +663,7 @@ fn execute_import(
             // Populate Dependencies (with validation)
             let mut deps = parsed.dependencies.clone();
             deps.extend(args.deps.clone());
-            let resolver = IdResolver::new(id_config.prefix.clone(), true);
+            let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
             for dep_str in deps {
                 let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
                 if !valid {
