@@ -3,7 +3,7 @@
 use crate::cli::UpdateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{DependencyType, Issue, Status};
+use crate::model::{Issue, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};

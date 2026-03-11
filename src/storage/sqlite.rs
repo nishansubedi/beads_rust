@@ -500,7 +500,6 @@ impl SqliteStorage {
                     let _ = self.conn.execute("ROLLBACK");
                     let backoff = base_backoff_ms * 2u64.pow(attempt);
                     std::thread::sleep(Duration::from_millis(backoff));
-                    continue;
                 }
                 Err(e) => {
                     let _ = self.conn.execute("ROLLBACK");
@@ -2345,14 +2344,6 @@ impl SqliteStorage {
         Ok(!rows.is_empty())
     }
 
-    fn issue_exists_in_tx(conn: &Connection, id: &str) -> Result<bool> {
-        let rows = conn.query_with_params(
-            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
-            &[SqliteValue::from(id)],
-        )?;
-        Ok(!rows.is_empty())
-    }
-
     fn issue_status_in_tx(conn: &Connection, id: &str) -> Result<Option<Status>> {
         let rows = conn.query_with_params(
             "SELECT status FROM issues WHERE id = ?",
@@ -2473,10 +2464,19 @@ impl SqliteStorage {
         }
 
         self.mutate("add_dependency", actor, |conn, ctx| {
-            if !Self::issue_exists_in_tx(conn, issue_id)? {
-                return Err(BeadsError::IssueNotFound {
-                    id: issue_id.to_string(),
-                });
+            match Self::issue_status_in_tx(conn, issue_id)? {
+                Some(Status::Tombstone) => {
+                    return Err(BeadsError::Validation {
+                        field: "issue_id".to_string(),
+                        reason: format!("cannot add dependency from tombstone issue: {issue_id}"),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Err(BeadsError::IssueNotFound {
+                        id: issue_id.to_string(),
+                    });
+                }
             }
             Self::ensure_dependency_target_exists_in_tx(conn, depends_on_id)?;
 
@@ -2680,7 +2680,12 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database update fails or cycle detected.
-    pub fn set_parent(&mut self, issue_id: &str, parent_id: Option<&str>, actor: &str) -> Result<()> {
+    pub fn set_parent(
+        &mut self,
+        issue_id: &str,
+        parent_id: Option<&str>,
+        actor: &str,
+    ) -> Result<()> {
         self.mutate("set_parent", actor, |conn, ctx| {
             // Remove existing parent
             conn.execute_with_params(
@@ -2748,6 +2753,21 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn add_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
         self.mutate("add_label", actor, |conn, ctx| {
+            match Self::issue_status_in_tx(conn, issue_id)? {
+                Some(Status::Tombstone) => {
+                    return Err(BeadsError::Validation {
+                        field: "issue_id".to_string(),
+                        reason: format!("cannot add label to tombstone issue: {issue_id}"),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Err(BeadsError::IssueNotFound {
+                        id: issue_id.to_string(),
+                    });
+                }
+            }
+
             let row = conn.query_row_with_params(
                 "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
@@ -2789,6 +2809,21 @@ impl SqliteStorage {
     /// Returns an error if the database update fails.
     pub fn remove_label(&mut self, issue_id: &str, label: &str, actor: &str) -> Result<bool> {
         self.mutate("remove_label", actor, |conn, ctx| {
+            match Self::issue_status_in_tx(conn, issue_id)? {
+                Some(Status::Tombstone) => {
+                    return Err(BeadsError::Validation {
+                        field: "issue_id".to_string(),
+                        reason: format!("cannot remove label from tombstone issue: {issue_id}"),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    return Err(BeadsError::IssueNotFound {
+                        id: issue_id.to_string(),
+                    });
+                }
+            }
+
             let rows = conn.execute_with_params(
                 "DELETE FROM labels WHERE issue_id = ? AND label = ?",
                 &[SqliteValue::from(issue_id), SqliteValue::from(label)],
