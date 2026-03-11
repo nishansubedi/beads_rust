@@ -5,7 +5,7 @@ use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 3;
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -84,7 +84,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Ready work composite index (most important for performance)
     CREATE INDEX IF NOT EXISTS idx_issues_ready
         ON issues(status, priority, created_at)
-        WHERE (status = 'open' OR status = 'in_progress')
+        WHERE status = 'open'
         AND ephemeral = 0
         AND pinned = 0
         AND is_template = 0;
@@ -990,7 +990,20 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute(
             "CREATE INDEX idx_issues_ready
              ON issues(status, priority, created_at)
-             WHERE (status = 'open' OR status = 'in_progress')
+             WHERE status = 'open'
+             AND ephemeral = 0
+             AND pinned = 0
+             AND is_template = 0",
+        )?;
+    }
+
+    if user_version < 4 && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 4 (ready excludes in_progress)");
+        conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
+        conn.execute(
+            "CREATE INDEX idx_issues_ready
+             ON issues(status, priority, created_at)
+             WHERE status = 'open'
              AND ephemeral = 0
              AND pinned = 0
              AND is_template = 0",
@@ -1023,7 +1036,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         -- Ready work composite index (most important for performance)
         CREATE INDEX IF NOT EXISTS idx_issues_ready
             ON issues(status, priority, created_at)
-            WHERE (status = 'open' OR status = 'in_progress')
+            WHERE status = 'open'
             AND ephemeral = 0
             AND pinned = 0
             AND is_template = 0;

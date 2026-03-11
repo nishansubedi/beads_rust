@@ -36,7 +36,7 @@ This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) 
 ### Essential Commands
 
 ```bash
-# View ready issues (unblocked, not deferred)
+# View ready issues (open, unblocked, not deferred)
 br ready              # or: bd ready
 
 # List and search
@@ -65,7 +65,7 @@ br sync --status      # Check sync status
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. `br ready` shows only open, unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
 - **Types**: task, bug, feature, epic, chore, docs, question
 - **Blocking**: `br dep add <issue> <depends-on>` to add dependencies

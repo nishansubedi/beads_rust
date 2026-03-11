@@ -16,7 +16,7 @@ Commands:
   close        Close an issue
   reopen       Reopen an issue
   delete       Delete an issue (creates tombstone)
-  ready        List ready issues (unblocked, not deferred)
+  ready        List ready issues (open, unblocked, not deferred)
   blocked      List blocked issues
   search       Search issues
   dep          Manage dependencies

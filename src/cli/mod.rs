@@ -837,7 +837,7 @@ pub enum Commands {
         command: QueryCommands,
     },
 
-    /// List ready issues (unblocked, not deferred)
+    /// List ready issues (open, unblocked, not deferred)
     Ready(ReadyArgs),
 
     /// Reopen an issue

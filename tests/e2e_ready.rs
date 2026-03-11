@@ -123,6 +123,67 @@ fn setup_workspace_with_issues() -> (BrWorkspace, Vec<String>) {
 }
 
 #[test]
+fn ready_cli_excludes_in_progress_issues() {
+    let _log = common::test_log("ready_cli_excludes_in_progress_issues");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let open_issue = run_br(&workspace, ["create", "Open issue"], "create_open_issue");
+    assert!(
+        open_issue.status.success(),
+        "create open failed: {}",
+        open_issue.stderr
+    );
+    let open_id = parse_created_id(&open_issue.stdout);
+
+    let claimed_issue = run_br(
+        &workspace,
+        ["create", "Claimed issue"],
+        "create_claimed_issue",
+    );
+    assert!(
+        claimed_issue.status.success(),
+        "create claimed failed: {}",
+        claimed_issue.stderr
+    );
+    let claimed_id = parse_created_id(&claimed_issue.stdout);
+
+    let claim = run_br(
+        &workspace,
+        ["update", &claimed_id, "--status", "in_progress"],
+        "claim_issue",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    let result = run_br(
+        &workspace,
+        ["ready", "--json"],
+        "ready_excludes_in_progress",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+
+    assert!(
+        issues
+            .iter()
+            .map(|issue| issue["id"].as_str().unwrap())
+            .any(|id| id == open_id.as_str()),
+        "open issue should still appear in ready output"
+    );
+    assert!(
+        !issues
+            .iter()
+            .map(|issue| issue["id"].as_str().unwrap())
+            .any(|id| id == claimed_id.as_str()),
+        "in-progress issue should not appear in ready output"
+    );
+}
+
+#[test]
 fn ready_cli_filters_by_assignee() {
     let _log = common::test_log("ready_cli_filters_by_assignee");
     let (workspace, ids) = setup_workspace_with_issues();

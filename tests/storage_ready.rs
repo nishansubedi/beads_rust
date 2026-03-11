@@ -581,7 +581,7 @@ fn ready_excludes_blocked_issues_with_filters() {
 // ============================================================================
 
 #[test]
-fn ready_includes_open_and_in_progress() {
+fn ready_excludes_in_progress_but_keeps_open() {
     let mut storage = test_db();
 
     let open = fixtures::IssueBuilder::new("Open issue")
@@ -606,7 +606,7 @@ fn ready_includes_open_and_in_progress() {
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
 
     assert!(ids.contains(&open.id));
-    assert!(ids.contains(&in_progress.id));
+    assert!(!ids.contains(&in_progress.id));
     assert!(!ids.contains(&closed.id));
     assert!(!ids.contains(&deferred.id));
 }
