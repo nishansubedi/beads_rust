@@ -586,6 +586,111 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
 
 ## Safety Invariants
 
+### Workspace Health Contract
+
+The workspace health contract answers one question consistently across startup,
+`doctor`, write recovery, and sync status:
+
+> Given the current `.beads/` state, what is authoritative, what is derived,
+> what may be rebuilt automatically, and what must never be discarded or
+> silently normalized away?
+
+This contract is intentionally stricter than "can the command proceed right
+now." The goal is to make every surface classify the same workspace with the
+same vocabulary and the same recovery envelope.
+
+### Health States
+
+| State | Meaning | Expected system posture |
+|-------|---------|-------------------------|
+| `healthy` | SQLite, JSONL, metadata, and derived state agree closely enough for normal operation | Proceed normally; no repair messaging |
+| `drifted` | Primary and interchange state are both readable, but freshness or path metadata disagree | Report drift explicitly; prefer import/export reconciliation over repair |
+| `degraded-recoverable` | Primary storage is damaged or incomplete, but authoritative evidence exists to rebuild safely | Preserve evidence, rebuild only through the allowed repair path, then re-verify |
+| `quarantined` | State is unsafe to mutate automatically because the authority source is ambiguous or itself damaged | Refuse risky mutation, preserve artifacts, require operator intervention |
+
+### Authority Model
+
+| State family | Examples | Authority level | Why |
+|-------------|----------|-----------------|-----|
+| Primary data | `issues`, `dependencies`, `labels`, `comments` tables; semantically equivalent JSONL issue records | Authoritative | These describe the actual issue graph and cannot be silently discarded |
+| Interchange data | `.beads/issues.jsonl` plus its content hash / mtime witnesses | Authoritative interchange copy | This is the git-facing source used for rebuild/import/export decisions |
+| Workspace metadata | `.beads/metadata.json`, config layers, sync timestamps/hashes in DB metadata | Control-plane evidence | Needed to resolve paths, detect drift, and explain why a workspace is classified a certain way |
+| Derived state | `dirty_issues`, `export_hashes`, `blocked_issues_cache`, `child_counters`, stale markers | Rebuildable | These speed up operations or summarize state, but should never outrank authoritative issue data |
+
+### Invariant Matrix
+
+| Surface | Object | Required invariant | Allowed automatic action | Forbidden silent behavior |
+|---------|--------|--------------------|--------------------------|---------------------------|
+| Primary data | `issues` + relational tables | Issue rows, dependencies, labels, and comments must remain representable either in SQLite or in valid JSONL records | Rebuild SQLite from valid JSONL when the DB family is recoverably damaged | Dropping primary issue data because a derived table is inconsistent |
+| Primary data | SQLite database family (`beads.db`, `-wal`, `-shm`, `-journal`) | The DB family must be treated as one unit when diagnosing corruption or recovery | Quarantine the whole family into `.beads/.br_recovery/` before rebuilding | Deleting or overwriting only one sidecar and pretending the rest are canonical |
+| Interchange data | `.beads/issues.jsonl` | JSONL must be parseable, conflict-free, and prefix-consistent before import | Reject import and preserve the file for manual repair | Best-effort partial import of malformed or conflicted JSONL |
+| Interchange data | DB vs JSONL freshness | Empty/stale export must never overwrite non-empty authoritative JSONL by accident | Refuse export unless the operator explicitly forces the destructive direction | Treating a missing import as permission to publish an empty snapshot |
+| Metadata | `.beads/metadata.json` path mapping | Resolved DB + JSONL targets must point at the intended workspace and be explainable | Rehydrate missing defaults from the canonical workspace layout and config rules | Silently operating on a different workspace than the one diagnostics describe |
+| Metadata | Sync witness keys (`last_import_time`, `last_export_time`, `jsonl_content_hash`, JSONL mtime witness) | Metadata must explain whether DB or JSONL is newer and whether divergence is expected | Recompute witness metadata after successful import/export | Claiming a workspace is healthy when witness data proves drift or missing export/import |
+| Metadata | Prefix/config resolution | Effective prefix and safety-relevant config must be source-traceable | Surface the winning config layer in diagnostics | Forcing absent CLI bools or env overrides into false certainty |
+| Derived state | `dirty_issues` | Dirty flags may lag but must never redefine issue truth | Recompute/clear after verified export | Using stale dirty flags as proof that data itself is corrupt |
+| Derived state | `export_hashes` | Export hashes may be rebuilt from authoritative issue content | Regenerate during import/export finalization | Treating missing hashes as a reason to discard issue rows |
+| Derived state | `blocked_issues_cache` | Cache may be stale; blocked truth comes from the dependency graph | Rebuild cache locally or after repair/import | Reporting cache staleness as unrecoverable workspace corruption |
+| Derived state | `child_counters` and similar summaries | Summary tables must match authoritative parent/child relationships eventually | Recompute from primary graph state | Trusting counters over real dependency or parent-child edges |
+
+### Primary-Data Repair Rules
+
+These rules exist so tests and diagnostics can assert what is never allowed.
+
+1. Primary issue data may only be replaced by a rebuild when there is a valid,
+   authoritative interchange source to rebuild from.
+2. Any rebuild of SQLite from JSONL must preserve the original DB family in
+   `.beads/.br_recovery/` before replacement.
+3. Row-level or index-level corruption that affects writes is classified as
+   `degraded-recoverable`, not as permission to mutate around the bad row.
+4. Prefix mismatch, malformed JSONL, or unresolved conflict markers promote the
+   workspace to `quarantined` for import/rebuild purposes.
+
+### Derived-State Rebuild Rules
+
+Derived state can be repaired more aggressively because it is not the source of
+truth, but only within the boundaries below.
+
+1. `blocked_issues_cache` may be rebuilt from the current dependency graph.
+2. `dirty_issues` and `export_hashes` may be cleared or regenerated only after
+   a verified export/import transition.
+3. Summary structures such as `child_counters` may be recomputed from the
+   primary graph whenever authoritative issue rows are known-good.
+4. Rebuilding derived state must not hide disagreement between SQLite, JSONL,
+   and metadata. If primary/interchange drift remains, the workspace is still
+   `drifted` or `quarantined`.
+
+### Cross-Surface Reporting Contract
+
+| Surface | Must report | Must not do silently |
+|---------|-------------|----------------------|
+| Startup / open | Whether the workspace is healthy, drifted, recoverable, or quarantined; whether an automatic DB rebuild was attempted; where evidence was preserved | Auto-rebuild from ambiguous or invalid JSONL, or collapse corruption into a generic `NOT_INITIALIZED` story |
+| `br doctor` | Structural anomalies, JSONL integrity, metadata drift, sync witness disagreement, and whether repair is local-derived-state-only vs full DB rebuild | Emit a clean bill of health when another surface would reject the same workspace |
+| Write recovery | Distinguish lock contention from corruption; identify when a mutation can retry once after rebuild | Retry blindly against uncertain state or persist partial side effects without surfacing them |
+| `br sync --status` / export/import preflight | Which side is newer, whether divergence is safe, and whether the requested direction is destructive | Treat stale/empty export conditions as healthy just because files exist |
+
+### Incident Evidence Bundle
+
+Every real-world incident should be reducible to this bundle so future beads and
+tests talk about the same evidence:
+
+| Capture item | Why it is required |
+|--------------|--------------------|
+| Failing command plus exact stdout/stderr | Establishes the observed symptom and whether the failure happened at open, write, sync, or reporting time |
+| `br doctor --json` | Gives the structured health classification surface for the same workspace |
+| `br sync --status` | Shows freshness/drift direction between DB and JSONL |
+| `br where` | Proves which workspace/database/JSONL paths were actually targeted |
+| `br config list -v` | Preserves config provenance and environment overrides that changed behavior |
+| `.beads/metadata.json` | Captures the explicit DB/JSONL routing contract the workspace claimed to use |
+| `.beads/issues.jsonl` | Preserves the authoritative interchange copy used for taxonomy classification and rebuild decisions |
+| Presence plus hashes of `beads.db`, `beads.db-wal`, `beads.db-shm`, and `beads.db-journal` when present | Distinguishes missing-file drift from sidecar mismatch and partial-copy failures |
+| Directory listing of `.beads/`, `.beads/.br_recovery/`, and `.beads/.br_history/` | Preserves recovery artifacts and interrupted-operation evidence |
+| Environment overrides and process context (`BD_DB`, `BD_DATABASE`, `BEADS_JSONL`, `BEADS_DIR`, `NO_COLOR`, active agents/processes) | Explains discovery/path/output drift and multi-actor contention |
+
+This bundle is intentionally small enough to request in the first reply to a
+field failure while still being sufficient to classify the failure against the
+workspace taxonomy without speculative follow-up.
+
 ### File System Safety
 
 1. **All writes confined to `.beads/`**

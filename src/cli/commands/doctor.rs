@@ -63,6 +63,8 @@ struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
 }
 
+const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+
 fn push_check(
     checks: &mut Vec<CheckResult>,
     name: &str,
@@ -82,6 +84,97 @@ fn has_error(checks: &[CheckResult]) -> bool {
     checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Error))
+}
+
+fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
+    report.checks.iter().any(|check| {
+        if check.name != "db.recoverable_anomalies" {
+            return false;
+        }
+
+        if check
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
+        {
+            return true;
+        }
+
+        check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("findings"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    finding
+                        .as_str()
+                        .is_some_and(|message| message.contains(BLOCKED_CACHE_STALE_FINDING))
+                })
+            })
+    })
+}
+
+fn push_inspection_error(
+    checks: &mut Vec<CheckResult>,
+    name: &str,
+    context: &str,
+    err: &BeadsError,
+) {
+    push_check(
+        checks,
+        name,
+        CheckStatus::Error,
+        Some(format!("{context}: {err}")),
+        None,
+    );
+}
+
+fn build_issue_write_probe_check(
+    issue_id: &str,
+    update_result: std::result::Result<usize, FrankenError>,
+    rollback_result: std::result::Result<usize, FrankenError>,
+) -> CheckResult {
+    let mut details = serde_json::json!({ "issue_id": issue_id });
+
+    match (update_result, rollback_result) {
+        (Ok(_), Ok(_)) => CheckResult {
+            name: "db.write_probe".to_string(),
+            status: CheckStatus::Ok,
+            message: Some(format!(
+                "Rollback-only issue write succeeded for {issue_id}"
+            )),
+            details: None,
+        },
+        (Ok(_), Err(rollback_err)) => {
+            details["rollback_error"] = serde_json::json!(rollback_err.to_string());
+            CheckResult {
+                name: "db.write_probe".to_string(),
+                status: CheckStatus::Error,
+                message: Some(format!(
+                    "Rollback-only issue write succeeded but rollback failed: {rollback_err}"
+                )),
+                details: Some(details),
+            }
+        }
+        (Err(update_err), Ok(_)) => CheckResult {
+            name: "db.write_probe".to_string(),
+            status: CheckStatus::Error,
+            message: Some(format!("Rollback-only issue write failed: {update_err}")),
+            details: Some(details),
+        },
+        (Err(update_err), Err(rollback_err)) => {
+            details["rollback_error"] = serde_json::json!(rollback_err.to_string());
+            CheckResult {
+                name: "db.write_probe".to_string(),
+                status: CheckStatus::Error,
+                message: Some(format!(
+                    "Rollback-only issue write failed and rollback also failed: {update_err}"
+                )),
+                details: Some(details),
+            }
+        }
+    }
 }
 
 fn repair_database_from_jsonl(
@@ -146,12 +239,38 @@ fn repair_database_from_jsonl(
     })
 }
 
-fn repair_recoverable_db_state(db_path: &Path) -> Result<LocalRepairResult> {
-    let storage = SqliteStorage::open(db_path)?;
-    let blocked_cache_rebuilt = storage.ensure_blocked_cache_fresh()?;
-    Ok(LocalRepairResult {
-        blocked_cache_rebuilt,
-    })
+fn repair_recoverable_db_state(db_path: &Path) -> LocalRepairResult {
+    if !db_path.exists() {
+        tracing::debug!(
+            path = %db_path.display(),
+            "Skipping local recoverable-state repair because the database file is missing"
+        );
+        return LocalRepairResult::default();
+    }
+
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => match storage.ensure_blocked_cache_fresh() {
+            Ok(blocked_cache_rebuilt) => LocalRepairResult {
+                blocked_cache_rebuilt,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "Skipping local recoverable-state repair; falling back to JSONL rebuild"
+                );
+                LocalRepairResult::default()
+            }
+        },
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping local recoverable-state repair because the database could not be opened"
+            );
+            LocalRepairResult::default()
+        }
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -502,7 +621,7 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
         .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
         == Some("stale")
     {
-        findings.push("blocked_issues_cache is marked stale and needs rebuild".to_string());
+        findings.push(BLOCKED_CACHE_STALE_FINDING.to_string());
     }
 
     if findings.is_empty() {
@@ -579,28 +698,11 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
     );
     let rollback_result = conn.execute("ROLLBACK");
 
-    if let Err(err) = rollback_result {
-        tracing::warn!(error = %err, issue_id = %issue_id, "ROLLBACK failed during doctor write probe");
-    }
-
-    match update_result {
-        Ok(_) => push_check(
-            checks,
-            "db.write_probe",
-            CheckStatus::Ok,
-            Some(format!(
-                "Rollback-only issue write succeeded for {issue_id}"
-            )),
-            None,
-        ),
-        Err(err) => push_check(
-            checks,
-            "db.write_probe",
-            CheckStatus::Error,
-            Some(format!("Rollback-only issue write failed: {err}")),
-            Some(serde_json::json!({ "issue_id": issue_id })),
-        ),
-    }
+    checks.push(build_issue_write_probe_check(
+        &issue_id,
+        update_result,
+        rollback_result,
+    ));
 }
 
 fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
@@ -1230,11 +1332,32 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         match Connection::open(db_path.to_string_lossy().into_owned()) {
             Ok(conn) => {
                 let _ = conn.execute("PRAGMA busy_timeout=30000");
-                required_schema_checks(&conn, &mut checks)?;
-                check_recoverable_anomalies(&conn, &mut checks)?;
+                if let Err(err) = required_schema_checks(&conn, &mut checks) {
+                    push_inspection_error(
+                        &mut checks,
+                        "schema.inspect",
+                        "Failed to inspect database schema",
+                        &err,
+                    );
+                }
+                if let Err(err) = check_recoverable_anomalies(&conn, &mut checks) {
+                    push_inspection_error(
+                        &mut checks,
+                        "db.recoverable_anomalies",
+                        "Failed to inspect recoverable anomalies",
+                        &err,
+                    );
+                }
                 check_integrity(&conn, &mut checks);
                 check_issue_write_probe(&conn, &mut checks);
-                check_db_count(&conn, jsonl_count, &mut checks)?;
+                if let Err(err) = check_db_count(&conn, jsonl_count, &mut checks) {
+                    push_inspection_error(
+                        &mut checks,
+                        "counts.db_vs_jsonl",
+                        "Failed to compare database and JSONL counts",
+                        &err,
+                    );
+                }
                 check_sync_metadata(&conn, jsonl_path.as_deref(), &mut checks);
                 check_sqlite_cli_integrity(&db_path, &mut checks);
             }
@@ -1336,7 +1459,11 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
-    let local_repair = repair_recoverable_db_state(&paths.db_path)?;
+    let local_repair = if report_has_blocked_cache_stale_finding(&initial.report) {
+        repair_recoverable_db_state(&paths.db_path)
+    } else {
+        LocalRepairResult::default()
+    };
     let after_local_repair = if local_repair.blocked_cache_rebuilt {
         collect_doctor_report(&beads_dir, &paths)?
     } else {
@@ -1505,6 +1632,54 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_doctor_report_reports_missing_metadata_tables_without_aborting() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute(
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                issue_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            ",
+        )
+        .unwrap();
+        fs::write(&jsonl_path, "{\"id\":\"bd-test\"}\n").unwrap();
+
+        let paths = config::ConfigPaths {
+            beads_dir: beads_dir.clone(),
+            db_path,
+            jsonl_path,
+            metadata: config::Metadata::default(),
+        };
+
+        let report = collect_doctor_report(&beads_dir, &paths).expect("doctor report");
+        let anomaly_check = find_check(&report.report.checks, "db.recoverable_anomalies")
+            .expect("recoverable anomalies check");
+
+        assert!(matches!(anomaly_check.status, CheckStatus::Error));
+        assert!(
+            anomaly_check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Failed to inspect recoverable anomalies")),
+            "unexpected check message: {:?}",
+            anomaly_check.message
+        );
+    }
+
+    #[test]
     fn test_integrity_check_messages_collects_all_rows() {
         let messages = integrity_check_messages(&[
             vec![SqliteValue::Text(
@@ -1573,6 +1748,46 @@ mod tests {
     }
 
     #[test]
+    fn test_report_has_blocked_cache_stale_finding_detects_detail_entry() {
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Error,
+                message: Some("config contains duplicate rows".to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [
+                        "config contains duplicate rows for key 'issue_prefix' (2 rows)",
+                        BLOCKED_CACHE_STALE_FINDING,
+                    ]
+                })),
+            }],
+        };
+
+        assert!(report_has_blocked_cache_stale_finding(&report));
+    }
+
+    #[test]
+    fn test_report_has_blocked_cache_stale_finding_ignores_other_recoverable_errors() {
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Error,
+                message: Some("config contains duplicate rows".to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [
+                        "config contains duplicate rows for key 'issue_prefix' (2 rows)",
+                        "metadata contains duplicate rows for key 'project' (2 rows)",
+                    ]
+                })),
+            }],
+        };
+
+        assert!(!report_has_blocked_cache_stale_finding(&report));
+    }
+
+    #[test]
     fn test_check_issue_write_probe_succeeds_on_healthy_database() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
@@ -1595,6 +1810,45 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|message| message.contains("bd-probe")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_marks_rollback_failure_as_error() {
+        let check = build_issue_write_probe_check(
+            "bd-probe",
+            Ok(1),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        );
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("rollback failed")),
+            "unexpected check message: {:?}",
+            check.message
+        );
+        assert_eq!(check.details.unwrap()["issue_id"], "bd-probe");
+    }
+
+    #[test]
+    fn test_build_issue_write_probe_check_preserves_write_failure() {
+        let check = build_issue_write_probe_check(
+            "bd-probe",
+            Err(FrankenError::Internal("write failed".to_string())),
+            Ok(0),
+        );
+
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("write failed")),
             "unexpected check message: {:?}",
             check.message
         );
@@ -1758,5 +2012,14 @@ mod tests {
             reopened.get_config("issue_prefix").unwrap().as_deref(),
             Some("proj")
         );
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_skips_missing_db() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("missing.db");
+
+        let local_repair = repair_recoverable_db_state(&db_path);
+        assert!(!local_repair.blocked_cache_rebuilt);
     }
 }

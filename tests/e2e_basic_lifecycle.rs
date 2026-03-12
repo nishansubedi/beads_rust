@@ -611,6 +611,99 @@ fn e2e_no_db_mixed_prefix_error() {
 }
 
 #[test]
+fn e2e_no_db_mutations_succeed_with_large_export_hash_batches() {
+    let _log = common::test_log("e2e_no_db_mutations_succeed_with_large_export_hash_batches");
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let now = Utc::now();
+
+    let seed_records: Vec<String> = (0..33)
+        .map(|idx| {
+            serde_json::to_string(&make_issue(
+                &format!("bd-a{idx:02}"),
+                &format!("Seed issue {idx}"),
+                now,
+            ))
+            .expect("serialize seed issue")
+        })
+        .collect();
+    fs::write(&jsonl_path, seed_records.join("\n") + "\n").expect("write seed jsonl");
+
+    let create = run_br(
+        &workspace,
+        ["--no-db", "create", "Large no-db create"],
+        "create_no_db_large_hash_batch",
+    );
+    assert!(
+        create.status.success(),
+        "create --no-db should succeed when export_hashes rewrite spans many rows: {}",
+        create.stderr
+    );
+    let created_id = parse_created_id(&create.stdout);
+    assert!(
+        !created_id.is_empty(),
+        "missing created id after no-db create"
+    );
+
+    let add_comment = run_br(
+        &workspace,
+        [
+            "--no-db",
+            "comments",
+            "add",
+            &created_id,
+            "Large no-db comment",
+            "--json",
+        ],
+        "comment_no_db_large_hash_batch",
+    );
+    assert!(
+        add_comment.status.success(),
+        "comments add --no-db should succeed after large export_hash rewrite: {}",
+        add_comment.stderr
+    );
+
+    let add_dependency = run_br(
+        &workspace,
+        ["--no-db", "dep", "add", &created_id, "bd-a00", "--json"],
+        "dep_add_no_db_large_hash_batch",
+    );
+    assert!(
+        add_dependency.status.success(),
+        "dep add --no-db should succeed after large export_hash rewrite: {}",
+        add_dependency.stderr
+    );
+
+    let created_record = fs::read_to_string(&jsonl_path)
+        .expect("read issues.jsonl")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse issue json"))
+        .find(|record| record["id"].as_str() == Some(created_id.as_str()))
+        .expect("created issue record in issues.jsonl");
+
+    assert_eq!(created_record["title"], "Large no-db create");
+    assert!(
+        created_record["comments"]
+            .as_array()
+            .is_some_and(|comments| comments
+                .iter()
+                .any(|comment| { comment["text"].as_str() == Some("Large no-db comment") })),
+        "created issue should retain the no-db comment mutation"
+    );
+    assert!(
+        created_record["dependencies"]
+            .as_array()
+            .is_some_and(|dependencies| dependencies
+                .iter()
+                .any(|dependency| { dependency["depends_on_id"].as_str() == Some("bd-a00") })),
+        "created issue should retain the no-db dependency mutation"
+    );
+}
+
+#[test]
 fn e2e_sync_manifest() {
     let workspace = BrWorkspace::new();
 

@@ -7,6 +7,7 @@ Common issues and solutions when using `br` (beads_rust).
 ## Table of Contents
 
 - [Quick Diagnostics](#quick-diagnostics)
+- [Workspace Failure Mode Catalog](#workspace-failure-mode-catalog)
 - [Initialization Issues](#initialization-issues)
 - [Issue Operations](#issue-operations)
 - [Dependency Problems](#dependency-problems)
@@ -41,6 +42,86 @@ br config list
 # Show version
 br version
 ```
+
+---
+
+## Workspace Failure Mode Catalog
+
+This section is the canonical inventory of workspace-level failure states that
+`br` is expected to survive, reject, quarantine, or repair. Use it before
+improvising a recovery plan.
+
+Not every failure mode below is a defect. Some entries describe deliberate
+safety stops, where the correct behavior is to refuse a risky operation and
+preserve evidence rather than guessing.
+
+### How to use this catalog
+
+1. Match the observed symptom to the closest failure class.
+2. Check the listed observability surface before making changes.
+3. Prefer the desired system response over ad hoc manual cleanup.
+4. Treat higher-risk classes as evidence-preservation problems first and a
+   convenience problem second.
+
+### Database corruption and structural anomalies
+
+| Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
+|---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
+| Missing SQLite family with valid JSONL | `beads.db` is absent but `issues.jsonl` still exists; startup can proceed only after rebuild | Workspace copied without DB, manual deletion, interrupted cleanup, sidecar-only residue | Startup warnings, `br doctor`, `.beads/` directory listing | Low if JSONL is authoritative and recent | Rebuild SQLite from JSONL automatically or via explicit repair path; do not treat as fatal corruption by itself |
+| Not-a-database / short-read DB file | Open fails with corruption-style errors such as `NotADatabase` or `ShortRead` | Truncated file, wrong file copied into `beads.db`, interrupted filesystem write | Startup error, `br doctor`, verbose logs, `src/config/mod.rs` recovery path | Medium to high depending on JSONL freshness | Preserve the original DB family in `.beads/.br_recovery/`, rebuild from JSONL, and surface the original open error if recovery also fails |
+| Malformed schema / duplicate schema entries / index mismatch | DB opens or probes with messages like `malformed database schema`, `table ... already exists`, `index ... already exists`, or `missing from index` | Corrupt schema pages, failed migration-like writes, damaged catalog/index state | Startup probe, `br doctor`, recovery warnings, integrity checks | Medium | Quarantine the DB family, rebuild from JSONL, and preserve the malformed original for forensic follow-up |
+| WAL / sidecar mismatch | Main DB exists but `-wal`, `-shm`, or `-journal` sidecars are stale or corrupted | Interrupted transaction, crash, partial copy of database family | Open failure, recovery warnings, presence of stale sidecars in `.beads/` | Medium | Move the whole database family into recovery together and rebuild atomically, rather than cherry-picking only `beads.db` |
+| Partially recoverable row-level corruption | Reads and `doctor` may succeed, but writes against certain rows fail with corruption-like or downstream constraint errors | Localized page/index corruption, inconsistent row/index state | Targeted mutation failures, repro tests such as row-specific update failures, verbose logs | Medium to high if writes are retried blindly | Detect as recoverable corruption, rebuild from JSONL, then retry the mutation once against the repaired DB instead of persisting partial state |
+
+### JSONL integrity and sync drift
+
+| Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
+|---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
+| Merge conflict markers in JSONL | Import fails with conflict marker diagnostics; file contains `<<<<<<<`, `=======`, `>>>>>>>` | Unresolved git merge on `.beads/issues.jsonl` | `br sync --import-only`, `br doctor`, direct file inspection | High if imported blindly | Reject import unconditionally; require manual conflict resolution before any DB mutation |
+| Malformed JSONL lines | Import or doctor reports parse errors on one or more lines | Manual edit mistake, truncated write, external tool damage | `br doctor`, `br sync --import-only`, JSON parser errors, line-numbered diagnostics | Medium | Refuse import, preserve the original file, and require line-level repair rather than best-effort partial mutation |
+| Stale DB relative to JSONL | Export refuses with stale-database language because JSONL contains issues missing from SQLite | Git pull/import not run yet, external JSONL edit, DB drift | `br sync --status`, export guard errors, doctor metadata checks | High if export proceeds | Refuse destructive export unless the operator explicitly chooses `--force`; preferred path is import-first |
+| Empty DB vs non-empty JSONL | Export sees zero DB issues while JSONL already has data | Wrong DB target, accidental DB reset, missing import after workspace copy | Export guard, `br sync --status`, `br stats`, `.beads/` inspection | High if empty export overwrites JSONL | Stop export by default; require import or an explicit `--force` acknowledgement |
+| Prefix mismatch / mixed prefixes | Import rejects with prefix mismatch or mixed project IDs | Wrong workspace, copied JSONL from another project, prefix drift after rename | Import preflight, `br doctor`, `br config get id.prefix`, JSONL inspection | Medium | Refuse import by default, surface the expected vs observed prefix, and only allow override when the operator intentionally wants remapping/repair |
+| JSONL-only write false negative | A `--no-db` write persists to JSONL and then still returns an error such as a bogus primary-key failure | Write-path bug in JSONL-only/in-memory flow, duplicate post-write validation, race in finalization | Command exit code vs actual JSONL contents, repro tests, follow-up reads | Medium because automation may retry a write that already succeeded | Report success when the write succeeded, keep genuine duplicate/conflict protection, and add regression coverage for create/comment/dependency paths |
+
+### Metadata, routing, and configuration drift
+
+| Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
+|---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
+| Wrong workspace discovered | Commands report `NOT_INITIALIZED` or operate on an unexpected `.beads/` tree | Running from the wrong cwd, stale `BEADS_DIR`, incorrect `--db`, ancestor discovery surprise | `br where`, `br config list -v`, resolved path output, env inspection | Medium | Surface the effective paths before mutation and prefer explicit path/DB selection over silent fallback |
+| DB/JSONL target drift | DB and JSONL refer to different workspaces or one target moved independently | External path overrides, copied `.beads/` trees, stale config or metadata | `br sync --status`, doctor metadata checks, config output | Medium to high | Detect and report path disagreement before mutation; require the operator to reconcile the intended authoritative target |
+| Missing or stale metadata after recovery | Commands work, but prefix or export metadata is absent/stale after rebuild/import | Rebuild path recreated core tables but not all metadata yet, interrupted export/import | Doctor metadata checks, startup config resolution, sync status | Low to medium | Rehydrate metadata from config/JSONL/project naming rules and report that an external import or recovery is pending |
+| Ambient env or legacy config leakage | Behavior changes unexpectedly between shells or hosts | Inherited `BD_DB`, `BD_DATABASE`, `BEADS_JSONL`, legacy config files, user-level config precedence | `br config list -v`, `env`, non-hermetic smoke tests | Medium | Show source-aware config diagnostics and make it obvious which layer won, rather than silently forcing defaults |
+
+### Lifecycle interruption and recovery artifacts
+
+| Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
+|---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
+| Interrupted export/import | Operation exits mid-flight; temp or backup artifacts remain | Crash, kill signal, disk-full, remote fs hiccup | Verbose logs, `.beads/.br_history/`, sync status, temp files | Medium | Use atomic temp-file + rename semantics so the last committed JSONL stays valid; leave artifacts as evidence instead of silently deleting them |
+| Failed automatic rebuild from JSONL | Startup attempts recovery but repair also fails | JSONL itself is invalid, prefix mismatch, recovery restore failure, deeper disk corruption | Startup warnings, `.beads/.br_recovery/`, structured error context | High | Preserve both the original DB family and any failed rebuild outputs, then surface the richer recovery error rather than hiding it |
+| Partial temp-file or backup cleanup | Recovery/history directories accumulate stale files after failed or interrupted operations | Interrupted rename sequence, manual restoration attempt, repeated failed rebuilds | `.beads/.br_recovery/`, `.beads/.br_history/`, filesystem inspection | Low direct risk, medium operator confusion | Prefer retaining artifacts over deleting them automatically; document how to inspect and prune only after the workspace is healthy |
+| Crash during mutating no-db workflow | Command may have updated JSONL but not all follow-up validation/reporting steps completed | In-memory/JSONL-only mutation path interrupted after persistence | Exit code mismatch, JSONL diff, follow-up read commands | Medium | Make post-write finalization idempotent and ensure the user can distinguish “state changed” from “state uncertain” without re-applying the mutation blindly |
+
+### Multi-actor contention and environment interference
+
+| Failure class | Symptom signature | Likely root cause | Observability surface | Data-loss risk | Desired system response |
+|---------------|-------------------|-------------------|-----------------------|----------------|-------------------------|
+| Database locked / concurrent writer | Mutating command fails or waits on lock acquisition | Multiple agents or shells writing the same workspace simultaneously | Lock timeout errors, verbose logs, active process list | Low to medium | Fail or retry cleanly; never reinterpret a lock as corruption, and keep the operator-visible error distinct from recovery flows |
+| Interleaved read/write staleness | One actor reads stale DB state while another updated JSONL or performed import/export | Missing import before read, overlapping sessions, long-lived processes | `br sync --status`, auto-import warnings, surprising ready/list results | Medium | Prefer import-before-read on commands that need freshness and keep stale-export guards enabled |
+| Existing-workspace assumptions hidden by hermetic tests | Commands work in fresh tempdirs but fail in long-lived or ambient-env workspaces | Test harness isolates env too aggressively, latent dependency on preexisting files/config | Non-hermetic smoke runs, field repros, ambient-env regressions | Medium | Keep a lightweight smoke profile against existing workspaces and preserve selected ambient env variables in regression coverage |
+| Multiple agents sharing one workspace with different local state | Different shells see different config/env resolution and reach different conclusions about safety | Divergent `HOME`, config files, env overrides, manually edited `.beads/` artifacts | `br config list -v`, shell env, agent repro transcripts | Medium | Make path/config provenance explicit in diagnostics so multi-actor sessions converge on the same effective workspace before mutating it |
+
+### Observability cheat sheet
+
+Use these surfaces first, before manual repair:
+
+- `br doctor`: workspace health, schema checks, metadata drift, JSONL parse/conflict checks
+- `br sync --status`: stale/empty export guard conditions and import/export pending state
+- `br config list -v`: effective configuration plus the source layer that won
+- `br where`: resolved workspace/database paths
+- Verbose logs (`-v`, `-vv`, `RUST_LOG=debug`): startup recovery, path validation, and sync preflight decisions
+- `.beads/.br_recovery/`: quarantined database families preserved during automatic rebuild
+- `.beads/.br_history/`: JSONL backup history preserved during export/restore flows
 
 ---
 

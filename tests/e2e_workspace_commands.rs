@@ -418,6 +418,117 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
     );
 }
 
+#[test]
+fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
+    let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_missing");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Repair doctor missing DB"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    assert!(db_path.exists(), "database should exist before deletion");
+    assert!(
+        jsonl_path.exists(),
+        "issues.jsonl should exist before repair test"
+    );
+
+    fs::remove_file(&db_path).expect("remove beads db");
+    assert!(
+        !db_path.exists(),
+        "database should be missing before repair"
+    );
+
+    let repaired = run_br(
+        &workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair_missing_db_json",
+    );
+    assert!(
+        repaired.status.success(),
+        "doctor --repair --json failed for missing db: stdout='{}' stderr='{}'",
+        repaired.stdout,
+        repaired.stderr
+    );
+
+    let payload = extract_json_payload(&repaired.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    assert_eq!(json["repaired"], Value::Bool(true));
+    assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["report"]["ok"], Value::Bool(false));
+    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
+    assert!(
+        db_path.exists(),
+        "doctor repair should recreate the database from JSONL"
+    );
+}
+
+#[test]
+fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
+    let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_malformed");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Repair doctor malformed DB"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    assert!(db_path.exists(), "database should exist before corruption");
+    assert!(
+        jsonl_path.exists(),
+        "issues.jsonl should exist before malformed-db repair test"
+    );
+
+    fs::write(&db_path, b"not a sqlite database").expect("corrupt beads db");
+
+    let repaired = run_br(
+        &workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair_malformed_db_json",
+    );
+    assert!(
+        repaired.status.success(),
+        "doctor --repair --json failed for malformed db: stdout='{}' stderr='{}'",
+        repaired.stdout,
+        repaired.stderr
+    );
+
+    let payload = extract_json_payload(&repaired.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
+    assert_eq!(json["repaired"], Value::Bool(true));
+    assert_eq!(json["verified"], Value::Bool(true));
+    assert_eq!(json["report"]["ok"], Value::Bool(false));
+    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
+
+    let show = run_br(
+        &workspace,
+        ["list", "--json"],
+        "list_after_malformed_repair",
+    );
+    assert!(
+        show.status.success(),
+        "list should succeed after malformed-db repair: {}",
+        show.stderr
+    );
+    let listed_payload = extract_json_payload(&show.stdout);
+    let listed: Value = serde_json::from_str(&listed_payload).expect("list json");
+    assert!(
+        listed.as_array().is_some_and(|issues| !issues.is_empty()),
+        "expected repaired database to contain at least one issue: {listed}"
+    );
+}
+
 // ============================================================================
 // info command tests
 // ============================================================================

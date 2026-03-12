@@ -3436,7 +3436,7 @@ routing:
         create_malformed_blocked_cache_db(&db_path);
         write_single_issue_jsonl(
             &jsonl_path,
-            "bd-recover-malformed",
+            "bd-rmalf1",
             "Recovered from malformed schema DB",
         );
 
@@ -3444,7 +3444,7 @@ routing:
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
         let issue = storage_ctx
             .storage
-            .get_issue("bd-recover-malformed")
+            .get_issue("bd-rmalf1")
             .expect("query issue")
             .expect("issue should exist after malformed-schema recovery");
 
@@ -3534,7 +3534,7 @@ routing:
 
         write_single_issue_jsonl(
             &jsonl_path,
-            "bd-recover-duplicate-config",
+            "bd-rdup01",
             "Recovered from duplicate config rows",
         );
 
@@ -3542,7 +3542,7 @@ routing:
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
         let issue = storage_ctx
             .storage
-            .get_issue("bd-recover-duplicate-config")
+            .get_issue("bd-rdup01")
             .expect("query issue")
             .expect("issue should exist after duplicate-config recovery");
 
@@ -3577,11 +3577,7 @@ routing:
         fs::create_dir_all(&external_dir).expect("create external dir");
 
         fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
-        write_single_issue_jsonl(
-            &jsonl_path,
-            "bd-recover-external",
-            "Recovered from external JSONL",
-        );
+        write_single_issue_jsonl(&jsonl_path, "bd-rxtrn1", "Recovered from external JSONL");
 
         let cli = CliOverrides {
             db: Some(db_path),
@@ -3590,7 +3586,7 @@ routing:
         let storage_ctx = open_storage_with_cli(&beads_dir, &cli).expect("storage");
         let issue = storage_ctx
             .storage
-            .get_issue("bd-recover-external")
+            .get_issue("bd-rxtrn1")
             .expect("query issue")
             .expect("issue should exist after recovery");
 
@@ -3947,14 +3943,14 @@ routing:
         fs::create_dir_all(&journal_dir).expect("create fake journal dir");
 
         fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
-        write_single_issue_jsonl(&jsonl_path, "bd-recover-journal", "Recovered with journal");
+        write_single_issue_jsonl(&jsonl_path, "bd-rjrnl1", "Recovered with journal");
         fs::write(journal_dir.join("sentinel.txt"), "keep me").expect("write sentinel");
 
         let storage_ctx =
             open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
         let issue = storage_ctx
             .storage
-            .get_issue("bd-recover-journal")
+            .get_issue("bd-rjrnl1")
             .expect("query issue")
             .expect("issue should exist after recovery");
 

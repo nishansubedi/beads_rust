@@ -398,7 +398,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Lint(_)
         | Commands::Stats(_)
         | Commands::Status(_)
-        | Commands::Orphans(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
         | Commands::Create(_)
@@ -426,6 +425,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Config { .. }
         | Commands::History(_)
+        | Commands::Orphans(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "self_update")]
@@ -662,6 +662,7 @@ mod tests {
             &["br", "schema"],
             &["br", "config", "path"],
             &["br", "history", "list"],
+            &["br", "orphans"],
         ];
 
         for argv in cases {

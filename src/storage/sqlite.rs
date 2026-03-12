@@ -11,6 +11,7 @@ use crate::storage::schema::{
 use crate::util::id::parse_id;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
+use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -21,7 +22,10 @@ use std::time::Duration;
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 30_000;
-const EXPORT_HASH_CHUNK_SIZE: usize = 900;
+// `fsqlite` starts returning false PRIMARY KEY conflicts when we try to
+// rewrite too many existing `export_hashes` rows in one statement. Keeping
+// these batches small avoids spurious post-export failures in `--no-db` mode.
+const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
@@ -453,11 +457,7 @@ impl SqliteStorage {
         );
         let rollback_result = self.conn.execute("ROLLBACK");
 
-        if let Err(rollback_err) = rollback_result {
-            tracing::warn!(error = %rollback_err, "ROLLBACK failed after issue write probe");
-        }
-
-        probe_result.map(|_| ()).map_err(Into::into)
+        finish_issue_mutation_write_probe(probe_result, rollback_result)
     }
 
     /// Execute a closure inside a write transaction with robust retry logic
@@ -5240,6 +5240,24 @@ impl SqliteStorage {
     }
 }
 
+fn finish_issue_mutation_write_probe(
+    probe_result: std::result::Result<usize, FrankenError>,
+    rollback_result: std::result::Result<usize, FrankenError>,
+) -> Result<()> {
+    match (probe_result, rollback_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
+        (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
+        (Err(probe_err), Err(rollback_err)) => {
+            tracing::warn!(
+                error = %rollback_err,
+                "ROLLBACK failed after issue write probe"
+            );
+            Err(BeadsError::Database(probe_err))
+        }
+    }
+}
+
 fn database_header_user_version(path: &Path) -> Option<u32> {
     if path == Path::new(":memory:") || !path.is_file() {
         return None;
@@ -8446,6 +8464,45 @@ mod tests {
     }
 
     #[test]
+    fn test_set_export_hashes_updates_large_existing_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let initial_hashes: Vec<(String, String)> = (0..40)
+            .map(|idx| {
+                let issue_id = format!("bd-hash-{idx:02}");
+                let issue = make_issue(
+                    &issue_id,
+                    &format!("Hash target {idx}"),
+                    Status::Open,
+                    2,
+                    None,
+                    created_at,
+                    None,
+                );
+                storage.create_issue(&issue, "tester").unwrap();
+                (issue_id, format!("hash-a-{idx:02}"))
+            })
+            .collect();
+
+        storage.set_export_hashes(&initial_hashes).unwrap();
+
+        let updated_hashes: Vec<(String, String)> = initial_hashes
+            .iter()
+            .map(|(issue_id, _)| (issue_id.clone(), format!("hash-b-{issue_id}")))
+            .collect();
+
+        let updated = storage.set_export_hashes(&updated_hashes).unwrap();
+        assert_eq!(updated, updated_hashes.len());
+
+        let (content_hash, _) = storage
+            .get_export_hash("bd-hash-39")
+            .unwrap()
+            .expect("updated export hash");
+        assert_eq!(content_hash, "hash-b-bd-hash-39");
+    }
+
+    #[test]
     fn test_diag_data_visibility() {
         use fsqlite_types::value::SqliteValue;
         // Simplest possible reproduction
@@ -9612,6 +9669,34 @@ mod tests {
         assert_eq!(
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
+        );
+    }
+
+    #[test]
+    fn test_finish_issue_mutation_write_probe_returns_rollback_error_when_cleanup_fails() {
+        let result = finish_issue_mutation_write_probe(
+            Ok(1),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        );
+
+        let err = result.expect_err("rollback failure should surface");
+        assert!(
+            err.to_string().contains("rollback failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_finish_issue_mutation_write_probe_prefers_write_error() {
+        let result = finish_issue_mutation_write_probe(
+            Err(FrankenError::Internal("write failed".to_string())),
+            Err(FrankenError::Internal("rollback failed".to_string())),
+        );
+
+        let err = result.expect_err("write failure should surface");
+        assert!(
+            err.to_string().contains("write failed"),
+            "unexpected error: {err}"
         );
     }
 }
