@@ -2,7 +2,8 @@ mod common;
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use chrono::Utc;
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_smoke_at_root_with_env};
+use common::isolated_workspace_failure_fixture;
 use serde_json::Value;
 use std::fs;
 use std::thread::sleep;
@@ -139,6 +140,103 @@ fn e2e_basic_lifecycle() {
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
+}
+
+#[test]
+fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
+    let _log =
+        common::test_log("e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths");
+    let fixture = isolated_workspace_failure_fixture("metadata_custom_paths")
+        .expect("metadata_custom_paths fixture");
+
+    let runner_root = fixture.root.join("ambient-env-smoke");
+    fs::create_dir_all(&runner_root).expect("create smoke runner root");
+
+    let external_beads_dir = fixture.root.join(".beads");
+    let external_beads_dir_str = external_beads_dir.display().to_string();
+    let custom_db_str = external_beads_dir.join("custom.db").display().to_string();
+    let custom_jsonl_str = external_beads_dir
+        .join("custom.jsonl")
+        .display()
+        .to_string();
+    let smoke_env = || {
+        vec![
+            ("BEADS_DIR".to_string(), external_beads_dir_str.clone()),
+            ("BR_OUTPUT_FORMAT".to_string(), "json".to_string()),
+        ]
+    };
+
+    let where_cmd = run_br_smoke_at_root_with_env(
+        &runner_root,
+        ["where"],
+        smoke_env(),
+        "non_hermetic_where_existing_workspace",
+    );
+    assert!(
+        where_cmd.status.success(),
+        "where smoke failed: {}",
+        where_cmd.stderr
+    );
+    let where_json: Value =
+        serde_json::from_str(&extract_json_payload(&where_cmd.stdout)).expect("where smoke json");
+    assert_eq!(
+        where_json["path"].as_str(),
+        Some(external_beads_dir_str.as_str())
+    );
+    assert_eq!(
+        where_json["database_path"].as_str(),
+        Some(custom_db_str.as_str())
+    );
+    assert_eq!(
+        where_json["jsonl_path"].as_str(),
+        Some(custom_jsonl_str.as_str())
+    );
+
+    let info_cmd = run_br_smoke_at_root_with_env(
+        &runner_root,
+        ["info"],
+        smoke_env(),
+        "non_hermetic_info_existing_workspace",
+    );
+    assert!(
+        info_cmd.status.success(),
+        "info smoke failed: {}",
+        info_cmd.stderr
+    );
+    let info_json: Value =
+        serde_json::from_str(&extract_json_payload(&info_cmd.stdout)).expect("info smoke json");
+    assert_eq!(
+        info_json["beads_dir"].as_str(),
+        Some(external_beads_dir_str.as_str())
+    );
+    assert_eq!(
+        info_json["database_path"].as_str(),
+        Some(custom_db_str.as_str())
+    );
+    assert_eq!(
+        info_json["jsonl_path"].as_str(),
+        Some(custom_jsonl_str.as_str())
+    );
+    assert!(
+        info_json["issue_count"].as_u64().is_some(),
+        "info smoke should report issue_count: {info_json}"
+    );
+
+    let sync_status_cmd = run_br_smoke_at_root_with_env(
+        &runner_root,
+        ["sync", "--status"],
+        smoke_env(),
+        "non_hermetic_sync_status_existing_workspace",
+    );
+    assert!(
+        sync_status_cmd.status.success(),
+        "sync --status smoke failed: {}",
+        sync_status_cmd.stderr
+    );
+    let sync_status_json: Value =
+        serde_json::from_str(&extract_json_payload(&sync_status_cmd.stdout))
+            .expect("sync status smoke json");
+    assert_eq!(sync_status_json["jsonl_exists"].as_bool(), Some(true));
 }
 
 #[test]

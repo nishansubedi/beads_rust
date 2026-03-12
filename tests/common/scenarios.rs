@@ -12,7 +12,7 @@
 #![allow(dead_code, clippy::similar_names)]
 
 use super::binary_discovery::{check_bd_version, discover_binaries};
-use super::dataset_registry::{IsolatedDataset, KnownDataset};
+use super::dataset_registry::{DatasetOverride, IsolatedDataset, KnownDataset};
 use super::harness::{
     CommandResult, ConformanceWorkspace as HarnessConformanceWorkspace, TestWorkspace,
 };
@@ -20,8 +20,10 @@ use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use tempfile::TempDir;
 use walkdir::WalkDir;
 
 /// Execution mode for a scenario.
@@ -308,7 +310,7 @@ impl Invariants {
 }
 
 /// Setup configuration for a scenario.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ScenarioSetup {
     /// Start with a fresh (empty) workspace, run `br init`
     #[default]
@@ -320,7 +322,7 @@ pub enum ScenarioSetup {
 }
 
 /// A command to run as part of a scenario.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScenarioCommand {
     /// Command arguments (e.g., `["create", "Test issue", "--priority", "1"]`)
     pub args: Vec<String>,
@@ -366,6 +368,212 @@ impl ScenarioCommand {
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = label.into();
         self
+    }
+}
+
+/// Expected result for a command inside a workspace evolution plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpectedCommandOutcome {
+    /// Command must succeed.
+    #[default]
+    Success,
+    /// Command must fail.
+    Failure,
+    /// Either success or failure is acceptable.
+    Either,
+}
+
+/// A `ScenarioCommand` with expectation and ID-capture semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvolutionCommand {
+    pub command: ScenarioCommand,
+    pub expected: ExpectedCommandOutcome,
+    pub capture_issue_id_as: Option<String>,
+}
+
+impl WorkspaceEvolutionCommand {
+    pub fn new(command: ScenarioCommand) -> Self {
+        Self {
+            command,
+            expected: ExpectedCommandOutcome::Success,
+            capture_issue_id_as: None,
+        }
+    }
+
+    pub const fn expect_failure(mut self) -> Self {
+        self.expected = ExpectedCommandOutcome::Failure;
+        self
+    }
+
+    pub const fn allow_either(mut self) -> Self {
+        self.expected = ExpectedCommandOutcome::Either;
+        self
+    }
+
+    pub fn capture_issue_id_as(mut self, alias: impl Into<String>) -> Self {
+        self.capture_issue_id_as = Some(alias.into());
+        self
+    }
+}
+
+/// A single step in a long-lived workspace evolution plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceEvolutionStep {
+    /// Run a `br` command, optionally capturing created IDs for later steps.
+    Command(WorkspaceEvolutionCommand),
+    /// Snapshot the current workspace so later steps can restore it.
+    Snapshot { label: String },
+    /// Append raw text to `.beads/issues.jsonl` to simulate external drift/corruption.
+    AppendToIssuesJsonl { label: String, text: String },
+    /// Restore `.beads/` and `.git/` from a named snapshot.
+    RestoreSnapshot {
+        label: String,
+        snapshot_label: String,
+    },
+}
+
+impl WorkspaceEvolutionStep {
+    pub fn command(command: WorkspaceEvolutionCommand) -> Self {
+        Self::Command(command)
+    }
+
+    pub fn snapshot(label: impl Into<String>) -> Self {
+        Self::Snapshot {
+            label: label.into(),
+        }
+    }
+
+    pub fn append_to_issues_jsonl(label: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::AppendToIssuesJsonl {
+            label: label.into(),
+            text: text.into(),
+        }
+    }
+
+    pub fn restore_snapshot(label: impl Into<String>, snapshot_label: impl Into<String>) -> Self {
+        Self::RestoreSnapshot {
+            label: label.into(),
+            snapshot_label: snapshot_label.into(),
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Command(command) => &command.command.label,
+            Self::Snapshot { label }
+            | Self::AppendToIssuesJsonl { label, .. }
+            | Self::RestoreSnapshot { label, .. } => label,
+        }
+    }
+}
+
+/// A deterministic plan that evolves one workspace across many commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEvolutionPlan {
+    pub name: String,
+    pub description: String,
+    pub seed: u64,
+    pub setup: ScenarioSetup,
+    pub steps: Vec<WorkspaceEvolutionStep>,
+}
+
+impl WorkspaceEvolutionPlan {
+    pub fn new(name: impl Into<String>, seed: u64) -> Self {
+        Self {
+            name: name.into(),
+            description: String::new(),
+            seed,
+            setup: ScenarioSetup::Fresh,
+            steps: Vec::new(),
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_setup(mut self, setup: ScenarioSetup) -> Self {
+        self.setup = setup;
+        self
+    }
+
+    pub fn with_steps<I>(mut self, steps: I) -> Self
+    where
+        I: IntoIterator<Item = WorkspaceEvolutionStep>,
+    {
+        self.steps = steps.into_iter().collect();
+        self
+    }
+
+    pub fn push_step(mut self, step: WorkspaceEvolutionStep) -> Self {
+        self.steps.push(step);
+        self
+    }
+
+    pub fn execute(&self) -> std::io::Result<MaterializedWorkspaceEvolution> {
+        let mut workspace = TestWorkspace::new("workspace_evolution", &self.name);
+        let snapshot_dir = TempDir::new()?;
+        let execution = execute_workspace_evolution_plan(self, &mut workspace, &snapshot_dir);
+
+        match execution {
+            Ok((mut events, aliases)) => {
+                let materialized =
+                    materialize_workspace_evolution(self, &workspace, &mut events, aliases)?;
+                workspace.finish(true);
+                Ok(materialized)
+            }
+            Err(err) => {
+                workspace.finish(false);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Event emitted while materializing a long-lived workspace evolution plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceEvolutionEventKind {
+    Command,
+    Snapshot,
+    Mutation,
+    Restore,
+}
+
+/// Result of one step inside a materialized workspace evolution run.
+#[derive(Debug, Clone)]
+pub struct WorkspaceEvolutionEvent {
+    pub label: String,
+    pub kind: WorkspaceEvolutionEventKind,
+    pub matched_expectation: bool,
+    pub command_result: Option<CommandResult>,
+    pub detail: Option<String>,
+}
+
+/// A materialized long-lived workspace ready to feed back into replay-style tests.
+#[derive(Debug)]
+pub struct MaterializedWorkspaceEvolution {
+    temp_dir: TempDir,
+    pub root: PathBuf,
+    pub beads_dir: PathBuf,
+    pub plan: WorkspaceEvolutionPlan,
+    pub events: Vec<WorkspaceEvolutionEvent>,
+    pub aliases: HashMap<String, String>,
+}
+
+impl MaterializedWorkspaceEvolution {
+    pub fn event(&self, label: &str) -> Option<&WorkspaceEvolutionEvent> {
+        self.events.iter().find(|event| event.label == label)
+    }
+
+    pub fn dataset_override(&self, reason: impl Into<String>) -> DatasetOverride {
+        DatasetOverride::new(&self.root, reason).with_name(self.plan.name.clone())
+    }
+
+    pub fn materialize_into(&self, target_root: impl AsRef<Path>) -> std::io::Result<()> {
+        copy_workspace_state(&self.root, target_root.as_ref())?;
+        copy_dir_contents(self.root.join("logs"), target_root.as_ref().join("logs"))?;
+        Ok(())
     }
 }
 
@@ -2090,6 +2298,303 @@ fn run_scenario_command(
     }
 }
 
+fn execute_workspace_evolution_plan(
+    plan: &WorkspaceEvolutionPlan,
+    workspace: &mut TestWorkspace,
+    snapshot_dir: &TempDir,
+) -> std::io::Result<(Vec<WorkspaceEvolutionEvent>, HashMap<String, String>)> {
+    prepare_workspace_evolution(plan, workspace)?;
+
+    let mut aliases = HashMap::new();
+    let mut events = Vec::with_capacity(plan.steps.len());
+    let mut snapshots = HashMap::new();
+
+    run_workspace_evolution_setup_commands(plan, workspace, &mut aliases, &mut events)?;
+
+    for step in &plan.steps {
+        let event = execute_workspace_evolution_step(
+            workspace,
+            step,
+            snapshot_dir,
+            &mut aliases,
+            &mut snapshots,
+        )?;
+        events.push(event);
+    }
+
+    Ok((events, aliases))
+}
+
+fn prepare_workspace_evolution(
+    plan: &WorkspaceEvolutionPlan,
+    workspace: &mut TestWorkspace,
+) -> std::io::Result<()> {
+    if let ScenarioSetup::Dataset(dataset) = &plan.setup {
+        populate_workspace_with_dataset(workspace, *dataset)?;
+    }
+
+    if matches!(&plan.setup, ScenarioSetup::Fresh) {
+        let init = workspace.init_br();
+        if !init.success {
+            return Err(std::io::Error::other(format!(
+                "workspace evolution init failed: {}",
+                init.stderr
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn run_workspace_evolution_setup_commands(
+    plan: &WorkspaceEvolutionPlan,
+    workspace: &mut TestWorkspace,
+    aliases: &mut HashMap<String, String>,
+    events: &mut Vec<WorkspaceEvolutionEvent>,
+) -> std::io::Result<()> {
+    if let ScenarioSetup::Commands(commands) = &plan.setup {
+        for command in commands {
+            let evolution_command = WorkspaceEvolutionCommand::new(command.clone());
+            let event =
+                execute_workspace_evolution_command(workspace, &evolution_command, aliases)?;
+            events.push(event);
+        }
+    }
+
+    Ok(())
+}
+
+fn execute_workspace_evolution_step(
+    workspace: &mut TestWorkspace,
+    step: &WorkspaceEvolutionStep,
+    snapshot_dir: &TempDir,
+    aliases: &mut HashMap<String, String>,
+    snapshots: &mut HashMap<String, PathBuf>,
+) -> std::io::Result<WorkspaceEvolutionEvent> {
+    match step {
+        WorkspaceEvolutionStep::Command(command) => {
+            execute_workspace_evolution_command(workspace, command, aliases)
+        }
+        WorkspaceEvolutionStep::Snapshot { label } => {
+            let snapshot_root = snapshot_dir.path().join(label);
+            copy_workspace_state(&workspace.root, &snapshot_root)?;
+            snapshots.insert(label.clone(), snapshot_root);
+            Ok(workspace_evolution_event(
+                label,
+                WorkspaceEvolutionEventKind::Snapshot,
+                "captured workspace snapshot",
+            ))
+        }
+        WorkspaceEvolutionStep::AppendToIssuesJsonl { label, text } => {
+            append_text_to_issues_jsonl(&workspace.beads_dir, text)?;
+            Ok(workspace_evolution_event(
+                label,
+                WorkspaceEvolutionEventKind::Mutation,
+                "appended raw text to .beads/issues.jsonl",
+            ))
+        }
+        WorkspaceEvolutionStep::RestoreSnapshot {
+            label,
+            snapshot_label,
+        } => {
+            let snapshot_root = snapshots.get(snapshot_label).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("workspace snapshot `{snapshot_label}` not found for step `{label}`"),
+                )
+            })?;
+            copy_workspace_state(snapshot_root, &workspace.root)?;
+            Ok(workspace_evolution_event(
+                label,
+                WorkspaceEvolutionEventKind::Restore,
+                format!("restored workspace snapshot `{snapshot_label}`"),
+            ))
+        }
+    }
+}
+
+fn workspace_evolution_event(
+    label: &str,
+    kind: WorkspaceEvolutionEventKind,
+    detail: impl Into<String>,
+) -> WorkspaceEvolutionEvent {
+    WorkspaceEvolutionEvent {
+        label: label.to_string(),
+        kind,
+        matched_expectation: true,
+        command_result: None,
+        detail: Some(detail.into()),
+    }
+}
+
+fn materialize_workspace_evolution(
+    plan: &WorkspaceEvolutionPlan,
+    workspace: &TestWorkspace,
+    events: &mut [WorkspaceEvolutionEvent],
+    aliases: HashMap<String, String>,
+) -> std::io::Result<MaterializedWorkspaceEvolution> {
+    let materialized_temp_dir = TempDir::new()?;
+    let materialized_root = materialized_temp_dir.path().to_path_buf();
+    copy_workspace_state(&workspace.root, &materialized_root)?;
+    copy_dir_contents(workspace.root.join("logs"), materialized_root.join("logs"))?;
+    remap_workspace_evolution_logs(events, &workspace.root, &materialized_root);
+
+    Ok(MaterializedWorkspaceEvolution {
+        temp_dir: materialized_temp_dir,
+        root: materialized_root.clone(),
+        beads_dir: materialized_root.join(".beads"),
+        plan: plan.clone(),
+        events: events.to_vec(),
+        aliases,
+    })
+}
+
+fn execute_workspace_evolution_command(
+    workspace: &mut TestWorkspace,
+    command: &WorkspaceEvolutionCommand,
+    aliases: &mut HashMap<String, String>,
+) -> std::io::Result<WorkspaceEvolutionEvent> {
+    let resolved = resolve_workspace_evolution_command(command, aliases);
+    let result = run_scenario_command(workspace, &resolved, None);
+    let matched_expectation = command_matches_expectation(command.expected, &result);
+
+    if !matched_expectation {
+        return Err(std::io::Error::other(format!(
+            "workspace evolution step `{}` expected {:?}, got exit {}",
+            command.command.label, command.expected, result.exit_code
+        )));
+    }
+
+    let mut detail = None;
+    if let Some(alias) = &command.capture_issue_id_as {
+        let id = extract_issue_id_from_output(&result.stdout).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "workspace evolution step `{}` did not emit an issue id for alias `{alias}`",
+                command.command.label
+            ))
+        })?;
+        aliases.insert(alias.clone(), id.clone());
+        detail = Some(format!("captured `{alias}` as `{id}`"));
+    }
+
+    Ok(WorkspaceEvolutionEvent {
+        label: command.command.label.clone(),
+        kind: WorkspaceEvolutionEventKind::Command,
+        matched_expectation: true,
+        command_result: Some(result),
+        detail,
+    })
+}
+
+fn resolve_workspace_evolution_command(
+    command: &WorkspaceEvolutionCommand,
+    aliases: &HashMap<String, String>,
+) -> ScenarioCommand {
+    ScenarioCommand {
+        args: command
+            .command
+            .args
+            .iter()
+            .map(|arg| apply_aliases(arg, aliases))
+            .collect(),
+        env: command
+            .command
+            .env
+            .iter()
+            .map(|(key, value)| (apply_aliases(key, aliases), apply_aliases(value, aliases)))
+            .collect(),
+        stdin: command
+            .command
+            .stdin
+            .as_ref()
+            .map(|input| apply_aliases(input, aliases)),
+        label: command.command.label.clone(),
+    }
+}
+
+fn apply_aliases(value: &str, aliases: &HashMap<String, String>) -> String {
+    let mut resolved = value.to_string();
+    let mut keys: Vec<_> = aliases.keys().collect();
+    keys.sort_unstable();
+
+    for key in keys {
+        if let Some(replacement) = aliases.get(key) {
+            resolved = resolved.replace(&format!("{{{key}}}"), replacement);
+        }
+    }
+
+    resolved
+}
+
+fn command_matches_expectation(expected: ExpectedCommandOutcome, result: &CommandResult) -> bool {
+    match expected {
+        ExpectedCommandOutcome::Success => result.success,
+        ExpectedCommandOutcome::Failure => !result.success,
+        ExpectedCommandOutcome::Either => true,
+    }
+}
+
+fn extract_issue_id_from_output(output: &str) -> Option<String> {
+    let payload = extract_json_payload(output);
+    if let Ok(value) = serde_json::from_str::<Value>(&payload) {
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            return Some(id.to_string());
+        }
+
+        if let Some(array) = value.as_array()
+            && let Some(first) = array.first()
+            && let Some(id) = first.get("id").and_then(Value::as_str)
+        {
+            return Some(id.to_string());
+        }
+    }
+
+    None
+}
+
+fn append_text_to_issues_jsonl(beads_dir: &Path, text: &str) -> std::io::Result<()> {
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let needs_newline = std::fs::read_to_string(&jsonl_path)
+        .ok()
+        .is_some_and(|content| !content.is_empty() && !content.ends_with('\n'));
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&jsonl_path)?;
+
+    if needs_newline {
+        writeln!(file)?;
+    }
+
+    write!(file, "{text}")?;
+    if !text.ends_with('\n') {
+        writeln!(file)?;
+    }
+
+    Ok(())
+}
+
+fn copy_workspace_state(src_root: &Path, dst_root: &Path) -> std::io::Result<()> {
+    copy_dir_contents(src_root.join(".beads"), dst_root.join(".beads"))?;
+    copy_dir_contents(src_root.join(".git"), dst_root.join(".git"))?;
+    Ok(())
+}
+
+fn remap_workspace_evolution_logs(
+    events: &mut [WorkspaceEvolutionEvent],
+    src_root: &Path,
+    dst_root: &Path,
+) {
+    for event in events {
+        if let Some(result) = event.command_result.as_mut()
+            && let Ok(relative) = result.log_path.strip_prefix(src_root)
+        {
+            result.log_path = dst_root.join(relative);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum BinaryTarget {
     Br,
@@ -2382,6 +2887,211 @@ pub mod catalog {
         )
         .with_compare_mode(CompareMode::ExitCodeOnly)
     }
+
+    fn seeded_title(seed: u64, role: &str) -> String {
+        format!("seed-{seed}-{role}")
+    }
+
+    fn seeded_reason(seed: u64, action: &str) -> String {
+        format!("seed-{seed}-{action}")
+    }
+
+    fn command_step(args: impl IntoIterator<Item = String>, label: &str) -> WorkspaceEvolutionStep {
+        WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+            ScenarioCommand::new(args).with_label(label),
+        ))
+    }
+
+    fn captured_create_step(
+        seed: u64,
+        role: &str,
+        alias: &str,
+        label: &str,
+    ) -> WorkspaceEvolutionStep {
+        WorkspaceEvolutionStep::command(
+            WorkspaceEvolutionCommand::new(
+                ScenarioCommand::new(vec![
+                    "create".to_string(),
+                    seeded_title(seed, role),
+                    "--json".to_string(),
+                    "--no-auto-flush".to_string(),
+                ])
+                .with_label(label),
+            )
+            .capture_issue_id_as(alias),
+        )
+    }
+
+    fn stale_read_step(command: &str, label: &str) -> WorkspaceEvolutionStep {
+        command_step(
+            vec![
+                "--no-auto-import".to_string(),
+                "--allow-stale".to_string(),
+                command.to_string(),
+                "--json".to_string(),
+            ],
+            label,
+        )
+    }
+
+    fn sync_flush_step(label: &str) -> WorkspaceEvolutionStep {
+        command_step(
+            vec![
+                "sync".to_string(),
+                "--flush-only".to_string(),
+                "--json".to_string(),
+            ],
+            label,
+        )
+    }
+
+    fn close_step(
+        seed: u64,
+        issue_alias: &str,
+        action: &str,
+        label: &str,
+        no_auto_flush: bool,
+    ) -> WorkspaceEvolutionStep {
+        let mut args = vec![
+            "close".to_string(),
+            format!("{{{issue_alias}}}"),
+            "--reason".to_string(),
+            seeded_reason(seed, action),
+            "--json".to_string(),
+        ];
+        if no_auto_flush {
+            args.push("--no-auto-flush".to_string());
+        }
+        command_step(args, label)
+    }
+
+    fn reopen_step(
+        seed: u64,
+        issue_alias: &str,
+        action: &str,
+        label: &str,
+    ) -> WorkspaceEvolutionStep {
+        command_step(
+            vec![
+                "reopen".to_string(),
+                format!("{{{issue_alias}}}"),
+                "--reason".to_string(),
+                seeded_reason(seed, action),
+                "--json".to_string(),
+            ],
+            label,
+        )
+    }
+
+    /// Deterministic long-lived workspace that mixes stale reads, explicit sync, and dependency churn.
+    pub fn long_lived_dependency_story(seed: u64) -> WorkspaceEvolutionPlan {
+        WorkspaceEvolutionPlan::new("long_lived_dependency_story", seed)
+            .with_description(
+                "Seeded multi-command workspace evolution covering stale reads, explicit flush/import, dependency graph updates, and unblock transitions.",
+            )
+            .with_steps(vec![
+                captured_create_step(seed, "root", "root", "create_root"),
+                captured_create_step(seed, "child", "child", "create_child"),
+                stale_read_step("list", "list_stale_before_flush"),
+                sync_flush_step("flush_initial"),
+                command_step(
+                    vec![
+                        "dep".to_string(),
+                        "add".to_string(),
+                        "{child}".to_string(),
+                        "{root}".to_string(),
+                        "--json".to_string(),
+                    ],
+                    "link_dependency",
+                ),
+                command_step(vec!["ready".to_string(), "--json".to_string()], "ready_blocked"),
+                close_step(seed, "root", "close-root", "close_root", true),
+                stale_read_step("ready", "ready_after_close"),
+                sync_flush_step("flush_after_close"),
+                reopen_step(seed, "root", "reopen-root", "reopen_root"),
+                command_step(
+                    vec![
+                        "sync".to_string(),
+                        "--import-only".to_string(),
+                        "--force".to_string(),
+                        "--json".to_string(),
+                    ],
+                    "import_after_reopen",
+                ),
+                close_step(seed, "root", "final-close-root", "close_root_final", false),
+                command_step(vec!["ready".to_string(), "--json".to_string()], "ready_final"),
+                sync_flush_step("flush_final"),
+            ])
+    }
+
+    /// Deterministic long-lived workspace that intentionally corrupts JSONL, observes failure, and restores a known-good snapshot.
+    pub fn long_lived_recovery_story(seed: u64) -> WorkspaceEvolutionPlan {
+        WorkspaceEvolutionPlan::new("long_lived_recovery_story", seed)
+            .with_description(
+                "Seeded workspace evolution covering explicit flush, external JSONL corruption, expected import failure, snapshot restore, and clean replay handoff.",
+            )
+            .with_steps(vec![
+                WorkspaceEvolutionStep::command(
+                    WorkspaceEvolutionCommand::new(
+                        ScenarioCommand::new(vec![
+                            "create".to_string(),
+                            seeded_title(seed, "recovery"),
+                            "--json".to_string(),
+                        ])
+                        .with_label("create_recovery_issue"),
+                    )
+                    .capture_issue_id_as("recovery"),
+                ),
+                WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+                    ScenarioCommand::new(["sync", "--flush-only", "--json"])
+                        .with_label("flush_recovery_baseline"),
+                )),
+                WorkspaceEvolutionStep::snapshot("stable_recovery_snapshot"),
+                WorkspaceEvolutionStep::append_to_issues_jsonl(
+                    "append_conflict_marker",
+                    format!("<<<<<<< seed-{seed}\nnot valid json\n=======\nstill bad\n>>>>>>> replay\n"),
+                ),
+                WorkspaceEvolutionStep::command(
+                    WorkspaceEvolutionCommand::new(
+                        ScenarioCommand::new(["sync", "--import-only", "--json"])
+                            .with_label("import_corrupt"),
+                    )
+                    .expect_failure(),
+                ),
+                WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+                    ScenarioCommand::new(vec![
+                        "--no-auto-import".to_string(),
+                        "--allow-stale".to_string(),
+                        "list".to_string(),
+                        "--json".to_string(),
+                    ])
+                    .with_label("list_stale_after_failure"),
+                )),
+                WorkspaceEvolutionStep::restore_snapshot(
+                    "restore_recovery_snapshot",
+                    "stable_recovery_snapshot",
+                ),
+                WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+                    ScenarioCommand::new(["sync", "--import-only", "--force", "--json"])
+                        .with_label("import_restored"),
+                )),
+                WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+                    ScenarioCommand::new(["list", "--json"]).with_label("list_recovered"),
+                )),
+                WorkspaceEvolutionStep::command(WorkspaceEvolutionCommand::new(
+                    ScenarioCommand::new(["sync", "--flush-only", "--json"])
+                        .with_label("flush_recovered"),
+                )),
+            ])
+    }
+
+    /// Deterministic catalog of long-lived workspace evolutions for a seed.
+    pub fn long_lived_seed_suite(seed: u64) -> Vec<WorkspaceEvolutionPlan> {
+        vec![
+            long_lived_dependency_story(seed),
+            long_lived_recovery_story(seed),
+        ]
+    }
 }
 
 // ============================================================================
@@ -2390,9 +3100,55 @@ pub mod catalog {
 
 #[cfg(test)]
 mod tests {
+    use super::super::dataset_registry::isolated_from_override;
     use super::*;
+    use assert_cmd::Command;
+    use std::ffi::OsStr;
     use std::path::Path;
     use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn should_clear_materialized_env(key: &OsStr) -> bool {
+        let key = key.to_string_lossy();
+        key.starts_with("BD_")
+            || key.starts_with("BEADS_")
+            || matches!(
+                key.as_ref(),
+                "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+            )
+    }
+
+    fn run_materialized_br(root: &Path, args: &[&str], label: &str) -> CommandResult {
+        let bin_path = assert_cmd::cargo::cargo_bin!("br");
+        let mut command = Command::new(bin_path);
+        command.current_dir(root);
+        command.args(args);
+
+        for (key, _) in std::env::vars_os() {
+            if should_clear_materialized_env(&key) {
+                command.env_remove(key);
+            }
+        }
+
+        command.env("NO_COLOR", "1");
+        command.env("RUST_BACKTRACE", "1");
+        command.env("HOME", root);
+
+        let start = std::time::Instant::now();
+        let output = command.output().expect("run materialized br");
+
+        CommandResult {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            success: output.status.success(),
+            duration: start.elapsed(),
+            log_path: root.join("logs").join(format!("{label}.log")),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        }
+    }
 
     #[test]
     fn test_normalization_rules_apply() {
@@ -3431,5 +4187,97 @@ mod tests {
         remove_field_path(&mut value, "user.profile.secret");
 
         assert!(value["user"]["profile"].get("secret").is_none());
+    }
+
+    #[test]
+    fn workspace_evolution_seed_suite_is_deterministic() {
+        let baseline = catalog::long_lived_seed_suite(17);
+        let same_seed = catalog::long_lived_seed_suite(17);
+        let different_seed = catalog::long_lived_seed_suite(18);
+
+        assert_eq!(baseline, same_seed);
+        assert_ne!(baseline, different_seed);
+    }
+
+    #[test]
+    fn workspace_evolution_dependency_story_materializes_replayable_workspace() {
+        let materialized = catalog::long_lived_dependency_story(23)
+            .execute()
+            .expect("dependency story should execute");
+
+        let ready_event = materialized
+            .event("ready_after_close")
+            .expect("ready_after_close event");
+        assert!(ready_event.matched_expectation);
+
+        let child_id = materialized
+            .aliases
+            .get("child")
+            .expect("captured child id")
+            .clone();
+
+        let ready = run_materialized_br(&materialized.root, &["ready", "--json"], "ready_replay");
+        assert!(ready.success, "materialized ready failed: {}", ready.stderr);
+
+        let ready_json: Value =
+            serde_json::from_str(&extract_json_payload(&ready.stdout)).expect("ready json");
+        let ready_items = ready_json.as_array().expect("ready array");
+        assert!(
+            ready_items
+                .iter()
+                .any(|item| { item.get("id").and_then(Value::as_str) == Some(child_id.as_str()) }),
+            "child issue should become ready after blocker closure"
+        );
+
+        let isolated = isolated_from_override(
+            &materialized.dataset_override("verify long-lived dependency story replay handoff"),
+        )
+        .expect("isolated replay copy");
+        assert!(
+            isolated.metadata.issue_count >= 2,
+            "replayed workspace should retain seeded issues"
+        );
+    }
+
+    #[test]
+    fn workspace_evolution_recovery_story_restores_clean_replay_input() {
+        let materialized = catalog::long_lived_recovery_story(29)
+            .execute()
+            .expect("recovery story should execute");
+
+        let import_corrupt = materialized
+            .event("import_corrupt")
+            .expect("import_corrupt event");
+        assert!(import_corrupt.matched_expectation);
+        assert!(
+            !import_corrupt
+                .command_result
+                .as_ref()
+                .expect("import result")
+                .success,
+            "corrupt import should fail but remain an expected step"
+        );
+
+        let list = run_materialized_br(&materialized.root, &["list", "--json"], "list_replay");
+        assert!(list.success, "materialized list failed: {}", list.stderr);
+
+        let target = TempDir::new().expect("materialize target");
+        materialized
+            .materialize_into(target.path())
+            .expect("copy materialized workspace");
+        assert!(
+            target.path().join(".beads").join("issues.jsonl").exists(),
+            "materialized workspace should include JSONL export"
+        );
+
+        let isolated = isolated_from_override(&DatasetOverride::new(
+            target.path(),
+            "verify restored workspace can re-enter override flow",
+        ))
+        .expect("isolated restored workspace");
+        assert!(
+            isolated.metadata.issue_count >= 1,
+            "restored workspace should remain replayable after recovery"
+        );
     }
 }

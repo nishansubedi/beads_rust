@@ -1,9 +1,18 @@
 use assert_cmd::Command;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
+
+const SMOKE_PRESERVED_ENV_KEYS: &[&str] = &[
+    "BEADS_DIR",
+    "BEADS_JSONL",
+    "BEADS_CACHE_DIR",
+    "BR_OUTPUT_FORMAT",
+    "TOON_DEFAULT_FORMAT",
+    "TOON_STATS",
+];
 
 fn should_clear_inherited_br_env(key: &OsStr) -> bool {
     let key = key.to_string_lossy();
@@ -15,9 +24,20 @@ fn should_clear_inherited_br_env(key: &OsStr) -> bool {
         )
 }
 
+fn should_preserve_smoke_env(key: &OsStr) -> bool {
+    let key = key.to_string_lossy();
+    SMOKE_PRESERVED_ENV_KEYS.contains(&key.as_ref())
+}
+
 fn clear_inherited_br_env(cmd: &mut Command) {
+    clear_inherited_br_env_except(cmd, &[]);
+}
+
+fn clear_inherited_br_env_except(cmd: &mut Command, preserve: &[&str]) {
     for (key, _) in std::env::vars_os() {
-        if should_clear_inherited_br_env(&key) {
+        let key_str = key.to_string_lossy();
+        let should_preserve = preserve.contains(&key_str.as_ref());
+        if should_clear_inherited_br_env(&key) && !should_preserve {
             cmd.env_remove(&key);
         }
     }
@@ -96,6 +116,23 @@ where
     )
 }
 
+pub fn run_br_smoke_at_root_with_env<I, S, E, K, V>(
+    root: &Path,
+    args: I,
+    env_vars: E,
+    label: &str,
+) -> BrRun
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let log_dir = root.join("logs");
+    run_br_full_in_root(root, &log_dir, args, env_vars, None, label, true)
+}
+
 fn run_br_full<I, S, E, K, V>(
     workspace: &BrWorkspace,
     args: I,
@@ -110,15 +147,48 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    run_br_full_in_root(
+        &workspace.root,
+        &workspace.log_dir,
+        args,
+        env_vars,
+        stdin_input,
+        label,
+        false,
+    )
+}
+
+fn run_br_full_in_root<I, S, E, K, V>(
+    root: &Path,
+    log_dir: &Path,
+    args: I,
+    env_vars: E,
+    stdin_input: Option<&str>,
+    label: &str,
+    preserve_smoke_env: bool,
+) -> BrRun
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    fs::create_dir_all(log_dir).expect("log dir");
+
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
-    cmd.current_dir(&workspace.root);
+    cmd.current_dir(root);
     cmd.args(args);
-    clear_inherited_br_env(&mut cmd);
+    if preserve_smoke_env {
+        clear_inherited_br_env_except(&mut cmd, SMOKE_PRESERVED_ENV_KEYS);
+    } else {
+        clear_inherited_br_env(&mut cmd);
+    }
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
     cmd.env("RUST_BACKTRACE", "1");
-    cmd.env("HOME", &workspace.root);
+    cmd.env("HOME", root);
 
     if let Some(input) = stdin_input {
         cmd.write_stdin(input);
@@ -131,7 +201,7 @@ where
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let log_path = workspace.log_dir.join(format!("{label}.log"));
+    let log_path = log_dir.join(format!("{label}.log"));
     let timestamp = SystemTime::now();
     let log_body = format!(
         "label: {label}\nstarted: {:?}\nduration: {:?}\nstatus: {}\nargs: {:?}\ncwd: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
@@ -139,7 +209,7 @@ where
         duration,
         output.status,
         cmd.get_args().collect::<Vec<_>>(),
-        workspace.root.display(),
+        root.display(),
         stdout,
         stderr
     );
@@ -167,7 +237,7 @@ pub fn extract_json_payload(stdout: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::should_clear_inherited_br_env;
+    use super::{should_clear_inherited_br_env, should_preserve_smoke_env};
     use std::ffi::OsStr;
 
     #[test]
@@ -193,6 +263,33 @@ mod tests {
             assert!(
                 !should_clear_inherited_br_env(OsStr::new(key)),
                 "{key} should not be blanket-cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_profile_preserves_selected_routing_and_output_env() {
+        for key in [
+            "BEADS_DIR",
+            "BEADS_CACHE_DIR",
+            "BEADS_JSONL",
+            "BR_OUTPUT_FORMAT",
+            "TOON_DEFAULT_FORMAT",
+            "TOON_STATS",
+        ] {
+            assert!(
+                should_preserve_smoke_env(OsStr::new(key)),
+                "{key} should be preserved for non-hermetic smoke coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_profile_still_clears_unrelated_legacy_beads_env() {
+        for key in ["BD_ACTOR", "BD_DB", "BD_CONFIG", "BEADS_DEBUG"] {
+            assert!(
+                !should_preserve_smoke_env(OsStr::new(key)),
+                "{key} should still be scrubbed in smoke mode"
             );
         }
     }

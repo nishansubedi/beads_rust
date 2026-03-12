@@ -108,15 +108,46 @@ pub struct DatasetRegistry {
     source_hashes: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFailureCommandOutcome {
+    Success,
+    SuccessWithAutoRecovery,
+    DoctorClean,
+    ReportsErrors,
+    RepairApplied,
+    RepairNoop,
+    StatusInSync,
+    StatusJsonlNewer,
+    FailsPrefixMismatch,
+    FailsConflictMarkers,
+    FailsInvalidJson,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceFailureCommandExpectation {
+    pub surface: String,
+    pub outcome: WorkspaceFailureCommandOutcome,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceFailureFixtureMetadata {
     pub name: String,
     pub family: String,
     pub description: String,
     pub expected_classification: String,
-    pub expected_command_surface: Vec<String>,
+    pub expected_command_outcomes: Vec<WorkspaceFailureCommandExpectation>,
     pub source_hint: String,
     pub notes: Vec<String>,
+}
+
+impl WorkspaceFailureFixtureMetadata {
+    pub fn outcome_for(&self, surface: &str) -> Option<WorkspaceFailureCommandOutcome> {
+        self.expected_command_outcomes
+            .iter()
+            .find(|expectation| expectation.surface == surface)
+            .map(|expectation| expectation.outcome)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1307,6 +1338,18 @@ mod tests {
                 "sidecar_wal_without_shm",
             ]
         );
+        for fixture in &fixtures {
+            assert!(
+                fixture.metadata.outcome_for("startup/open").is_some(),
+                "{} missing startup/open expectation",
+                fixture.metadata.name
+            );
+            assert!(
+                !fixture.metadata.expected_command_outcomes.is_empty(),
+                "{} missing command expectations",
+                fixture.metadata.name
+            );
+        }
     }
 
     #[test]

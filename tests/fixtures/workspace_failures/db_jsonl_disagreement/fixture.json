@@ -3,11 +3,27 @@
   "family": "drift",
   "description": "The database and JSONL export disagree because JSONL contains an extra issue record that was never imported into the database.",
   "expected_classification": "degraded",
-  "expected_command_surface": [
-    "startup/open",
-    "doctor",
-    "sync --status",
-    "sync --import-only"
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "fails_prefix_mismatch"
+    },
+    {
+      "surface": "create",
+      "outcome": "fails_prefix_mismatch"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "doctor_clean"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_jsonl_newer"
+    },
+    {
+      "surface": "sync --import-only",
+      "outcome": "fails_prefix_mismatch"
+    }
   ],
   "source_hint": "Models the DB/JSONL mismatch class called out in beads_rust-rsei.2.1.",
   "notes": [

@@ -27,8 +27,9 @@ pub use binary_discovery::{BinaryVersion, DiscoveredBinaries, discover_binaries}
 pub use dataset_registry::{
     DatasetIntegrityGuard, DatasetMetadata, DatasetOverride, DatasetProvenance, DatasetRegistry,
     IntegrityCheckResult, IsolatedDataset, IsolatedWorkspaceFailureFixture, KnownDataset,
-    WorkspaceFailureFixture, WorkspaceFailureFixtureMetadata, isolated_from_override,
-    isolated_workspace_failure_fixture, list_workspace_failure_fixtures, run_with_integrity,
+    WorkspaceFailureCommandExpectation, WorkspaceFailureCommandOutcome, WorkspaceFailureFixture,
+    WorkspaceFailureFixtureMetadata, isolated_from_override, isolated_workspace_failure_fixture,
+    list_workspace_failure_fixtures, run_with_integrity,
 };
 pub use harness::{ParallelismMode, ResourceGuardrails, RunnerPolicy};
 pub use report_indexer::{

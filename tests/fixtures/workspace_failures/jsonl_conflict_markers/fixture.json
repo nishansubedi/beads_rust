@@ -3,11 +3,31 @@
   "family": "malformed_jsonl",
   "description": "The JSONL export contains git merge conflict markers wrapped around otherwise valid records.",
   "expected_classification": "unsafe",
-  "expected_command_surface": [
-    "startup/open",
-    "doctor",
-    "sync --status",
-    "sync --import-only"
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "fails_conflict_markers"
+    },
+    {
+      "surface": "create",
+      "outcome": "fails_conflict_markers"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "fails_invalid_json"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_jsonl_newer"
+    },
+    {
+      "surface": "sync --import-only",
+      "outcome": "fails_conflict_markers"
+    }
   ],
   "source_hint": "Derived from the conflict-marker rejection tests in tests/e2e_sync_fuzz_edge_cases.rs.",
   "notes": [

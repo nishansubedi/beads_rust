@@ -3,11 +3,31 @@
   "family": "recovery_debris",
   "description": "A failed rebuild left a bad replacement database in place along with preserved backups and recovery artifacts.",
   "expected_classification": "recoverable",
-  "expected_command_surface": [
-    "startup/open",
-    "doctor --repair",
-    "sync --status",
-    "history"
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success_with_auto_recovery"
+    },
+    {
+      "surface": "create",
+      "outcome": "success_with_auto_recovery"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "repair_applied"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_in_sync"
+    },
+    {
+      "surface": "history",
+      "outcome": "success"
+    }
   ],
   "source_hint": "Inspired by the large repo-root recovery dumps collected during real-world investigation.",
   "notes": [

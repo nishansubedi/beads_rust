@@ -5,6 +5,7 @@ This corpus stores small, sanitized workspace roots for reliability regression w
 Each fixture directory contains:
 
 - `fixture.json`: human-readable metadata about the failure family and why it matters
+- `fixture.json.expected_command_outcomes`: the replay contract for the key surfaces this fixture is expected to exercise
 - `beads/`: the workspace payload that the loader materializes into `.beads/` inside an isolated test root
 
 Conventions:

@@ -3,10 +3,23 @@
   "family": "sidecar_mismatch",
   "description": "The workspace includes a stray WAL sidecar without a matching SHM sidecar or coordinated writer state.",
   "expected_classification": "degraded",
-  "expected_command_surface": [
-    "startup/open",
-    "doctor",
-    "sync --status"
+  "expected_command_outcomes": [
+    {
+      "surface": "startup/open",
+      "outcome": "success"
+    },
+    {
+      "surface": "create",
+      "outcome": "success"
+    },
+    {
+      "surface": "doctor",
+      "outcome": "doctor_clean"
+    },
+    {
+      "surface": "sync --status",
+      "outcome": "status_in_sync"
+    }
   ],
   "source_hint": "Represents the stale or missing sidecar family called out in beads_rust-rsei.2.1.",
   "notes": [
