@@ -53,6 +53,8 @@ impl DatasetMetadata {
     }
 }
 
+const SOURCE_COMMIT_OVERRIDE_ENV: &str = "BR_DATASET_SOURCE_COMMIT";
+
 /// Known datasets for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KnownDataset {
@@ -445,11 +447,44 @@ fn hash_beads_directory(beads_dir: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize())[..16].to_string())
 }
 
-/// Get git commit hash from a repository (if .git exists and git is available).
-fn get_git_commit(repo_path: &Path) -> Option<String> {
-    let git_dir = repo_path.join(".git");
-    if !git_dir.exists() {
+fn source_commit_override_with(
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    get_env(SOURCE_COMMIT_OVERRIDE_ENV)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn source_commit_override() -> Option<String> {
+    source_commit_override_with(|name| std::env::var(name).ok())
+}
+
+fn current_repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn compile_time_git_commit(repo_path: &Path) -> Option<String> {
+    if !repo_path.starts_with(current_repo_root()) {
         return None;
+    }
+
+    option_env!("VERGEN_GIT_SHA")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Get git commit hash from a repository.
+///
+/// This deliberately does not require `repo_path/.git` to exist because:
+/// - Git can discover parent repositories from a subdirectory.
+/// - Worktrees and offloaded environments may provide Git context without a
+///   literal `.git` entry at the dataset root.
+/// - RCH/offloaded runs can inject a stable override when Git metadata is not
+///   available in the synced checkout.
+fn get_git_commit(repo_path: &Path) -> Option<String> {
+    if let Some(override_commit) = source_commit_override() {
+        return Some(override_commit);
     }
 
     std::process::Command::new("git")
@@ -459,6 +494,8 @@ fn get_git_commit(repo_path: &Path) -> Option<String> {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|commit| !commit.is_empty())
+        .or_else(|| compile_time_git_commit(repo_path))
 }
 
 // =============================================================================
@@ -1255,5 +1292,32 @@ mod tests {
             isolated.metadata.source_commit.is_none(),
             "empty workspace should have no source_commit"
         );
+    }
+
+    #[test]
+    fn test_get_git_commit_discovers_parent_repo_from_subdir() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_subdir = repo_root.join("src");
+
+        assert!(
+            !repo_subdir.join(".git").exists(),
+            "test requires a normal repo subdirectory without its own .git entry"
+        );
+
+        assert_eq!(
+            get_git_commit(&repo_subdir),
+            get_git_commit(&repo_root),
+            "git commit detection should work from subdirectories via parent repo discovery"
+        );
+    }
+
+    #[test]
+    fn test_source_commit_override_trims_and_ignores_empty_values() {
+        assert_eq!(
+            source_commit_override_with(|_| Some(" abc1234 \n".to_string())),
+            Some("abc1234".to_string())
+        );
+        assert_eq!(source_commit_override_with(|_| Some("   ".to_string())), None);
+        assert_eq!(source_commit_override_with(|_| None), None);
     }
 }
