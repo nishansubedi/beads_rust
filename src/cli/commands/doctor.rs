@@ -8,15 +8,15 @@ use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
-    validate_sync_path_with_external,
+    PathValidation, compute_staleness, scan_conflict_markers, validate_no_git_path,
+    validate_sync_path, validate_sync_path_with_external,
 };
 use fsqlite::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1226,10 +1226,11 @@ fn check_sync_conflict_markers(jsonl_path: &Path, checks: &mut Vec<CheckResult>)
 #[allow(clippy::too_many_lines)]
 fn check_sync_metadata(
     conn: &Connection,
+    db_path: &Path,
     jsonl_path: Option<&Path>,
     checks: &mut Vec<CheckResult>,
 ) {
-    // Get metadata
+    // Get metadata for diagnostic details
     let last_import: Option<String> = conn
         .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
         .ok()
@@ -1266,24 +1267,19 @@ fn check_sync_metadata(
         details["jsonl_hash"] = serde_json::json!(&hash[..16.min(hash.len())]);
     }
 
-    // Determine staleness
+    // Determine staleness using the canonical compute_staleness() from sync module.
+    // This avoids duplicating logic that accounts for last_export_time, mtime witness
+    // fast-path, and content hash verification (issue #173).
     let (jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
-        if p.exists() {
-            let jsonl_mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
-
-            // JSONL is newer if it was modified after last import
-            let j_newer = last_import.as_ref().is_none_or(|import_time| {
-                chrono::DateTime::parse_from_rfc3339(import_time).is_ok_and(|import_ts| {
-                    let import_sys_time = std::time::SystemTime::from(import_ts);
-                    jsonl_mtime.is_some_and(|m| m > import_sys_time)
-                })
-            });
-
-            // DB is newer if there are dirty issues
-            let d_newer = dirty_count > 0;
-            (j_newer, d_newer)
-        } else {
-            (false, dirty_count > 0)
+        match SqliteStorage::open(db_path).and_then(|storage| compute_staleness(&storage, p)) {
+            Ok(staleness) => (staleness.jsonl_newer, staleness.db_newer),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "compute_staleness failed in doctor; falling back to dirty-count only"
+                );
+                (false, dirty_count > 0)
+            }
         }
     } else {
         (false, dirty_count > 0)
@@ -1408,7 +1404,7 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
                         &err,
                     );
                 }
-                check_sync_metadata(&conn, jsonl_path.as_deref(), &mut checks);
+                check_sync_metadata(&conn, &db_path, jsonl_path.as_deref(), &mut checks);
                 check_sqlite_cli_integrity(&db_path, &mut checks);
             }
             Err(err) => {

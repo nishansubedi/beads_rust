@@ -1820,13 +1820,14 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
         let (jsonl_mtime, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
 
         if storage.get_metadata(METADATA_JSONL_MTIME)?.as_deref() == Some(&jsonl_mtime_witness) {
-            let current_hash = compute_jsonl_hash(jsonl_path)?;
-            let stored_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+            // Optimization: if mtime matches exactly (down to fractional seconds),
+            // assume content hasn't changed. This avoids O(N) hash calculation
+            // on every command startup.
             return Ok(StalenessCheck {
                 dirty_count,
                 jsonl_exists: true,
                 jsonl_mtime: Some(jsonl_mtime),
-                jsonl_newer: stored_hash.as_deref() != Some(current_hash.as_str()),
+                jsonl_newer: false,
                 db_newer,
             });
         }
@@ -2684,20 +2685,13 @@ fn normalize_issue(issue: &mut Issue) {
         issue.ephemeral = true;
     }
 
-    // Repair closed_at invariant: if status is closed/tombstone, ensure closed_at is set
-    if matches!(
-        issue.status,
-        crate::model::Status::Closed | crate::model::Status::Tombstone
-    ) && issue.closed_at.is_none()
-    {
+    // Repair closed_at invariant: if status is terminal (closed/tombstone), ensure closed_at is set
+    if issue.status.is_terminal() && issue.closed_at.is_none() {
         issue.closed_at = Some(issue.updated_at);
     }
 
-    // If status is not closed/tombstone, clear closed_at
-    if !matches!(
-        issue.status,
-        crate::model::Status::Closed | crate::model::Status::Tombstone
-    ) {
+    // If status is not terminal, clear closed_at
+    if !issue.status.is_terminal() {
         issue.closed_at = None;
     }
 

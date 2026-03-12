@@ -978,94 +978,85 @@ impl SqliteStorage {
     /// transitive forward dependencies; if any reachable node equals `issue_id`,
     /// a cycle would be formed.
     ///
-    /// The previous implementation used a `WITH RECURSIVE` CTE, but
-    /// frankensqlite produces false positives for that query once the issue
-    /// count exceeds ~20 rows (see #131).  This Rust-side DFS is immune to
-    /// that bug and also avoids unbounded SQL recursion.
+    /// Uses lazy per-node BFS: instead of bulk-loading the entire dependency
+    /// graph into memory, each BFS step queries only the immediate neighbors
+    /// of the current frontier node.  On sparse graphs this visits a tiny
+    /// fraction of total edges, giving dramatic speedups for `dep add` on
+    /// large repositories (e.g. 813-issue graphs).
     ///
-    /// Performance: All edges are bulk-loaded into an in-memory adjacency list
-    /// with a single SQL query, then BFS runs purely in memory.  This is O(V+E)
-    /// in total rather than O(V * query_latency) with per-node queries.
+    /// Two kinds of edges are followed in the blocker graph:
+    /// 1. Standard deps (`issue_id -> depends_on_id`), filtered by type.
+    /// 2. Parent-child edges reversed (`depends_on_id -> issue_id`), since a
+    ///    parent finishing requires its children to finish first.
+    ///
+    /// A depth cap prevents pathological traversal on corrupted graphs.
     fn check_cycle(
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
-        // Bulk-load all relevant edges into an in-memory adjacency list.
-        // This replaces per-node SQL queries with a single bulk query.
-        let adj = Self::load_cycle_check_adjacency(conn, blocking_only)?;
+        // Build the per-node neighbor query.  We UNION two directions:
+        //   (a) standard deps: given node as issue_id, follow to depends_on_id
+        //   (b) parent-child reversed: given node as depends_on_id (parent),
+        //       follow to issue_id (child) -- because parent is blocked by child
+        let neighbor_sql = if blocking_only {
+            "SELECT depends_on_id FROM dependencies \
+             WHERE issue_id = ? AND type IN ('blocks', 'conditional-blocks', 'waits-for') \
+             UNION \
+             SELECT issue_id FROM dependencies \
+             WHERE depends_on_id = ? AND type = 'parent-child'"
+                .to_string()
+        } else {
+            "SELECT depends_on_id FROM dependencies \
+             WHERE issue_id = ? AND type != 'parent-child' \
+             UNION \
+             SELECT issue_id FROM dependencies \
+             WHERE depends_on_id = ? AND type = 'parent-child'"
+                .to_string()
+        };
 
-        let mut visited: HashSet<String> = HashSet::new();
+        let stmt = conn.prepare(&neighbor_sql)?;
+
+        let mut visited = HashSet::new();
+        // Level-synchronous BFS: process all nodes at one depth before moving
+        // to the next, so we can enforce a depth cap cleanly.
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
+        visited.insert(depends_on_id.to_string());
 
-        while let Some(current) = frontier.pop() {
-            if current == issue_id {
-                return Ok(true);
-            }
-            if !visited.insert(current.clone()) {
-                continue; // already visited
+        // No legitimate dependency chain should exceed this depth.  Prevents
+        // runaway traversal on corrupted or adversarial graphs.
+        const MAX_DEPTH: usize = 500;
+
+        for _depth in 0..MAX_DEPTH {
+            if frontier.is_empty() {
+                break;
             }
 
-            if let Some(neighbors) = adj.get(&current) {
-                frontier.extend(neighbors.iter().cloned());
+            let mut next_frontier = Vec::new();
+
+            for node in &frontier {
+                let rows = stmt.query_with_params(&[
+                    SqliteValue::from(node.as_str()),
+                    SqliteValue::from(node.as_str()),
+                ])?;
+
+                for row in &rows {
+                    if let Some(neighbor) = row.get(0).and_then(SqliteValue::as_text) {
+                        if neighbor == issue_id {
+                            return Ok(true); // Cycle detected -- early exit
+                        }
+                        if visited.insert(neighbor.to_string()) {
+                            next_frontier.push(neighbor.to_string());
+                        }
+                    }
+                }
             }
+
+            frontier = next_frontier;
         }
 
         Ok(false)
-    }
-
-    /// Bulk-load all dependency edges relevant to cycle detection into an
-    /// in-memory adjacency list (source -> Vec<target>).
-    ///
-    /// Two kinds of edges are included:
-    /// 1. Standard deps (issue_id -> depends_on_id) filtered by type.
-    /// 2. Parent-child edges reversed (depends_on_id -> issue_id), since a
-    ///    parent finishing requires its children to finish first.
-    fn load_cycle_check_adjacency(
-        conn: &Connection,
-        blocking_only: bool,
-    ) -> Result<HashMap<String, Vec<String>>> {
-        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-
-        // 1. Standard dependencies (issue_id -> depends_on_id)
-        let sql = if blocking_only {
-            "SELECT issue_id, depends_on_id FROM dependencies \
-             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
-        } else {
-            "SELECT issue_id, depends_on_id FROM dependencies \
-             WHERE type != 'parent-child'"
-        };
-        let rows = conn.query(sql)?;
-        for row in &rows {
-            if let (Some(from), Some(to)) = (
-                row.get(0).and_then(SqliteValue::as_text),
-                row.get(1).and_then(SqliteValue::as_text),
-            ) {
-                adj.entry(from.to_string())
-                    .or_default()
-                    .push(to.to_string());
-            }
-        }
-
-        // 2. Parent-child edges: parent -> child (depends_on_id is parent,
-        //    issue_id is child), so the direction in the blocker graph is
-        //    parent -> child.
-        let pc_rows = conn.query(
-            "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'",
-        )?;
-        for row in &pc_rows {
-            if let (Some(parent), Some(child)) = (
-                row.get(0).and_then(SqliteValue::as_text),
-                row.get(1).and_then(SqliteValue::as_text),
-            ) {
-                adj.entry(parent.to_string())
-                    .or_default()
-                    .push(child.to_string());
-            }
-        }
-
-        Ok(adj)
     }
 
     /// Update an issue's fields.
@@ -1166,22 +1157,28 @@ impl SqliteStorage {
 
             // Status
             if let Some(ref status) = updates.status {
-                let old_status = issue.status.as_str().to_string();
-                let was_terminal = issue.status.is_terminal();
+                let old_status_obj = issue.status.clone();
+                let old_status = old_status_obj.as_str().to_string();
+                let was_terminal = old_status_obj.is_terminal();
                 issue.status.clone_from(status);
                 add_update("status", SqliteValue::from(status.as_str()));
-                ctx.record_field_change(
-                    EventType::StatusChanged,
-                    id,
-                    Some(old_status),
-                    Some(status.as_str().to_string()),
-                    None,
-                );
 
-                // Record Closed event if status is now Closed
+                if status.as_str() != old_status {
+                    ctx.record_field_change(
+                        EventType::StatusChanged,
+                        id,
+                        Some(old_status),
+                        Some(status.as_str().to_string()),
+                        None,
+                    );
+                }
+
+                // Record Closed event if status is now Closed and wasn't before
                 if *status == Status::Closed {
-                    let reason = updates.close_reason.as_ref().and_then(Clone::clone);
-                    ctx.record_event(EventType::Closed, id, reason);
+                    if !was_terminal {
+                        let reason = updates.close_reason.as_ref().and_then(Clone::clone);
+                        ctx.record_event(EventType::Closed, id, reason);
+                    }
 
                     // Auto-set closed_at if not provided
                     if updates.closed_at.is_none() && issue.closed_at.is_none() {
@@ -1191,7 +1188,10 @@ impl SqliteStorage {
                     }
                 } else if *status == Status::Tombstone {
                     let reason = updates.close_reason.as_ref().and_then(Clone::clone);
-                    ctx.record_event(EventType::Deleted, id, reason.clone());
+
+                    if !was_terminal {
+                        ctx.record_event(EventType::Deleted, id, reason.clone());
+                    }
 
                     let now = Utc::now();
                     issue.deleted_at = Some(now);
@@ -1199,9 +1199,12 @@ impl SqliteStorage {
                     issue.delete_reason.clone_from(&reason);
                     add_update("deleted_at", SqliteValue::from(now.to_rfc3339()));
                     add_update("deleted_by", SqliteValue::from(actor));
-                    if let Some(r) = reason {
-                        add_update("delete_reason", SqliteValue::from(r));
-                    }
+                    // Always update delete_reason if we are setting to Tombstone,
+                    // using close_reason as fallback if provided.
+                    add_update(
+                        "delete_reason",
+                        SqliteValue::from(reason.as_deref().unwrap_or("")),
+                    );
                 } else {
                     if was_terminal && !status.is_terminal() {
                         ctx.record_event(EventType::Reopened, id, None);
@@ -1410,6 +1413,7 @@ impl SqliteStorage {
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
+        let was_terminal = issue.status.is_terminal();
         let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
         let mut tombstone_issue = issue;
@@ -1438,11 +1442,13 @@ impl SqliteStorage {
                 ],
             )?;
 
-            ctx.record_event(
-                EventType::Deleted,
-                id,
-                Some(format!("Deleted issue: {reason}")),
-            );
+            if !was_terminal {
+                ctx.record_event(
+                    EventType::Deleted,
+                    id,
+                    Some(format!("Deleted issue: {reason}")),
+                );
+            }
             ctx.mark_dirty(id);
             ctx.invalidate_cache();
 
