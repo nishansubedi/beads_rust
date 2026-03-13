@@ -213,32 +213,33 @@ fn completion_paths() -> Option<config::ConfigPaths> {
 }
 
 fn saved_queries_from_db(db_path: &Path) -> BTreeSet<String> {
-    let mut saved_queries = BTreeSet::new();
     if !db_path.is_file() {
-        return saved_queries;
+        return BTreeSet::new();
     }
 
-    let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
-        return saved_queries;
-    };
-    let _ = conn.execute("PRAGMA busy_timeout=0");
+    let Ok(queries) = config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+        let _ = conn.execute("PRAGMA busy_timeout=0");
+        let rows = conn.query("SELECT key FROM config")?;
+        let mut queries = BTreeSet::new();
 
-    let Ok(rows) = conn.query("SELECT key FROM config") else {
-        return saved_queries;
-    };
-
-    for row in &rows {
-        let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
-            continue;
-        };
-        if let Some(name) = key.strip_prefix(SAVED_QUERY_PREFIX)
-            && !name.trim().is_empty()
-        {
-            saved_queries.insert(name.to_string());
+        for row in &rows {
+            let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if let Some(name) = key.strip_prefix(SAVED_QUERY_PREFIX)
+                && !name.trim().is_empty()
+            {
+                queries.insert(name.to_string());
+            }
         }
-    }
 
-    saved_queries
+        Ok(queries)
+    }) else {
+        return BTreeSet::new();
+    };
+
+    queries
 }
 
 fn build_completion_index() -> CompletionIndex {

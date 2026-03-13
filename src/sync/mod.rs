@@ -27,7 +27,7 @@ use chrono::Utc;
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet, hash_map::RandomState};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -1327,7 +1327,7 @@ pub fn export_to_jsonl_with_policy(
     let mut issues = storage.get_all_issues_for_export()?;
 
     // Fetch dirty metadata for safe clearing later
-    let exported_marked_at = storage.get_dirty_issue_metadata()?;
+    let dirty_metadata = storage.get_dirty_issue_metadata()?;
 
     // Safety checks
     if !config.force && output_path.exists() {
@@ -1612,8 +1612,12 @@ pub fn export_to_jsonl_with_policy(
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
+        exported_marked_at: filter_dirty_metadata_for_export(
+            &dirty_metadata,
+            &exported_ids,
+            &skipped_tombstone_ids,
+        ),
         exported_ids,
-        exported_marked_at,
         skipped_tombstone_ids,
         content_hash,
         output_path: Some(output_path.to_string_lossy().to_string()),
@@ -1804,6 +1808,20 @@ pub struct StalenessCheck {
     pub db_newer: bool,
 }
 
+fn pending_export_state(
+    storage: &SqliteStorage,
+    jsonl_exists: bool,
+) -> Result<(usize, bool, bool)> {
+    let dirty_count = storage.get_dirty_issue_count()?;
+    let needs_flush = storage.get_metadata("needs_flush")?.as_deref() == Some("true");
+    let missing_jsonl_with_data = !jsonl_exists && storage.count_issues()? > 0;
+    Ok((
+        dirty_count,
+        needs_flush,
+        dirty_count > 0 || needs_flush || missing_jsonl_with_data,
+    ))
+}
+
 /// Compute staleness based on JSONL mtime + content hash and DB dirty state.
 ///
 /// Uses Lstat (`symlink_metadata`) for JSONL mtime to match classic bd behavior.
@@ -1812,22 +1830,26 @@ pub struct StalenessCheck {
 ///
 /// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
 pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
-    let dirty_count = storage.get_dirty_issue_count()?;
     let jsonl_exists = jsonl_path.exists();
-    let db_newer = dirty_count > 0;
+    let (dirty_count, _needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
 
     let (jsonl_mtime, jsonl_newer) = if jsonl_exists {
         let (jsonl_mtime, jsonl_mtime_witness) = observed_jsonl_mtime(jsonl_path)?;
 
         if storage.get_metadata(METADATA_JSONL_MTIME)?.as_deref() == Some(&jsonl_mtime_witness) {
-            // Optimization: if mtime matches exactly (down to fractional seconds),
-            // assume content hasn't changed. This avoids O(N) hash calculation
-            // on every command startup.
+            let jsonl_newer = storage
+                .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+                .as_ref()
+                .is_none_or(|stored_hash| {
+                    compute_jsonl_hash(jsonl_path)
+                        .map_or(true, |current_hash| &current_hash != stored_hash)
+                });
+
             return Ok(StalenessCheck {
                 dirty_count,
                 jsonl_exists: true,
                 jsonl_mtime: Some(jsonl_mtime),
-                jsonl_newer: false,
+                jsonl_newer,
                 db_newer,
             });
         }
@@ -1918,6 +1940,7 @@ pub fn auto_import_if_stale(
     beads_dir: &Path,
     jsonl_path: &Path,
     expected_prefix: Option<&str>,
+    allow_external_jsonl: bool,
     allow_stale: bool,
     no_auto_import: bool,
 ) -> Result<AutoImportResult> {
@@ -1952,8 +1975,6 @@ pub fn auto_import_if_stale(
         });
     }
 
-    let allow_external_jsonl =
-        crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path);
     let import_config = ImportConfig {
         // Auto-import should be strict about prefix mismatches to prevent
         // silently importing issues from another project.
@@ -2052,6 +2073,27 @@ fn normalize_issue_for_export(issue: &mut Issue) {
                 .then_with(|| left.id.cmp(&right.id))
         });
     }
+}
+
+fn filter_dirty_metadata_for_export(
+    dirty_metadata: &[(String, String)],
+    exported_ids: &[String],
+    skipped_tombstone_ids: &[String],
+) -> Vec<(String, String)> {
+    let dirty_by_id: HashMap<&str, &str> = dirty_metadata
+        .iter()
+        .map(|(issue_id, marked_at)| (issue_id.as_str(), marked_at.as_str()))
+        .collect();
+
+    exported_ids
+        .iter()
+        .chain(skipped_tombstone_ids.iter())
+        .filter_map(|issue_id| {
+            dirty_by_id
+                .get(issue_id.as_str())
+                .map(|marked_at| (issue_id.clone(), (*marked_at).to_string()))
+        })
+        .collect()
 }
 
 fn restore_foreign_keys_after_import(
@@ -2270,6 +2312,7 @@ fn try_incremental_auto_flush(
     storage: &mut SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
@@ -2340,7 +2383,7 @@ fn try_incremental_auto_flush(
     let export_config = ExportConfig {
         force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path),
+        allow_external_jsonl,
         ..Default::default()
     };
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
@@ -2394,15 +2437,13 @@ pub fn auto_flush(
     storage: &mut SqliteStorage,
     beads_dir: &Path,
     jsonl_path: &Path,
+    allow_external_jsonl: bool,
 ) -> Result<AutoFlushResult> {
     // Check for dirty issues or forced flush first
-    let dirty_count = storage.get_dirty_issue_count()?;
-    let needs_flush = storage
-        .get_metadata("needs_flush")?
-        .unwrap_or_else(|| "false".to_string())
-        == "true";
+    let jsonl_exists = jsonl_path.exists();
+    let (dirty_count, needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
 
-    if dirty_count == 0 && !needs_flush {
+    if !db_newer {
         tracing::debug!("Auto-flush: no dirty issues, skipping");
         return Ok(AutoFlushResult::default());
     }
@@ -2414,7 +2455,7 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(storage, beads_dir, jsonl_path) {
+        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -2435,9 +2476,9 @@ pub fn auto_flush(
 
     // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {
-        force: false,
+        force: needs_flush && dirty_count == 0,
         beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: crate::config::resolved_jsonl_path_is_external(beads_dir, jsonl_path),
+        allow_external_jsonl,
         ..Default::default()
     };
 
@@ -2642,6 +2683,18 @@ fn normalize_issue(issue: &mut Issue) {
     if !issue.labels.is_empty() {
         issue.labels.sort();
         issue.labels.dedup();
+    }
+
+    // Normalize dependency types (fix legacy underscores)
+    for dep in &mut issue.dependencies {
+        if let crate::model::DependencyType::Custom(custom) = &dep.dep_type {
+            let candidate = custom.replace('_', "-");
+            if let Ok(normalized) = candidate.parse::<crate::model::DependencyType>()
+                && !matches!(normalized, crate::model::DependencyType::Custom(_))
+            {
+                dep.dep_type = normalized;
+            }
+        }
     }
 
     // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
@@ -4257,8 +4310,16 @@ mod tests {
             .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
             .unwrap();
 
-        let result =
-            auto_import_if_stale(&mut storage, &beads_dir, &jsonl_path, None, true, false).unwrap();
+        let result = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            None,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         assert!(!result.attempted);
         assert_eq!(result.imported_count, 0);
     }
@@ -4276,8 +4337,16 @@ mod tests {
             .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
             .unwrap();
 
-        let result =
-            auto_import_if_stale(&mut storage, &beads_dir, &jsonl_path, None, false, true).unwrap();
+        let result = auto_import_if_stale(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
         assert!(!result.attempted);
         assert_eq!(result.imported_count, 0);
     }
@@ -4290,9 +4359,10 @@ mod tests {
 
         fs::write(&jsonl_path, "{\"id\":\"bd-1\"}\n").unwrap();
         let (_, jsonl_mtime_witness) = observed_jsonl_mtime(&jsonl_path).unwrap();
+        let current_hash = compute_jsonl_hash(&jsonl_path).unwrap();
 
         storage
-            .set_metadata(METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, &current_hash)
             .unwrap();
         storage
             .set_metadata(METADATA_JSONL_MTIME, &jsonl_mtime_witness)
@@ -4324,6 +4394,32 @@ mod tests {
         assert!(staleness.jsonl_exists);
         assert!(staleness.jsonl_newer);
         assert!(staleness.jsonl_mtime.is_some());
+    }
+
+    #[test]
+    fn test_compute_staleness_marks_db_newer_when_force_flush_is_pending() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        storage.set_metadata("needs_flush", "true").unwrap();
+
+        let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+        assert!(staleness.db_newer);
+        assert_eq!(staleness.dirty_count, 0);
+    }
+
+    #[test]
+    fn test_compute_staleness_marks_db_newer_when_jsonl_is_missing_but_db_has_issues() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-missing-jsonl", "DB only");
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
+        assert!(staleness.db_newer);
+        assert!(!staleness.jsonl_exists);
     }
 
     #[test]
@@ -4481,6 +4577,48 @@ mod tests {
 
         assert!(issue.content_hash.is_some());
         assert!(!issue.content_hash.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_normalize_issue_normalizes_legacy_standard_dependency_type_with_underscores() {
+        let mut issue = make_test_issue("bd-001", "Legacy dependency");
+        issue.dependencies.push(crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "bd-002".to_string(),
+            dep_type: crate::model::DependencyType::Custom("parent_child".to_string()),
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        normalize_issue(&mut issue);
+
+        assert_eq!(
+            issue.dependencies[0].dep_type,
+            crate::model::DependencyType::ParentChild
+        );
+    }
+
+    #[test]
+    fn test_normalize_issue_preserves_custom_dependency_type_with_underscores() {
+        let mut issue = make_test_issue("bd-001", "Custom dependency");
+        issue.dependencies.push(crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: "bd-002".to_string(),
+            dep_type: crate::model::DependencyType::Custom("review_needed".to_string()),
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+
+        normalize_issue(&mut issue);
+
+        assert_eq!(
+            issue.dependencies[0].dep_type,
+            crate::model::DependencyType::Custom("review_needed".to_string())
+        );
     }
 
     #[test]
@@ -5256,6 +5394,31 @@ mod tests {
                 .get_metadata(METADATA_JSONL_MTIME)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn test_filter_dirty_metadata_for_export_only_includes_exported_ids() {
+        let dirty_metadata = vec![
+            ("bd-1".to_string(), "t1".to_string()),
+            ("bd-2".to_string(), "t2".to_string()),
+            ("bd-3".to_string(), "t3".to_string()),
+        ];
+        let exported_ids = vec!["bd-1".to_string()];
+        let skipped_tombstone_ids = vec!["bd-3".to_string()];
+
+        let filtered = filter_dirty_metadata_for_export(
+            &dirty_metadata,
+            &exported_ids,
+            &skipped_tombstone_ids,
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                ("bd-1".to_string(), "t1".to_string()),
+                ("bd-3".to_string(), "t3".to_string()),
+            ]
         );
     }
 

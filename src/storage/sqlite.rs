@@ -29,6 +29,7 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const IMPORT_LABEL_CHUNK_SIZE: usize = 400;
 const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
+const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
 
@@ -1024,11 +1025,7 @@ impl SqliteStorage {
         let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
         visited.insert(depends_on_id.to_string());
 
-        // No legitimate dependency chain should exceed this depth.  Prevents
-        // runaway traversal on corrupted or adversarial graphs.
-        const MAX_DEPTH: usize = 500;
-
-        for _depth in 0..MAX_DEPTH {
+        for _depth in 0..DEPENDENCY_TRAVERSAL_MAX_DEPTH {
             if frontier.is_empty() {
                 break;
             }
@@ -5213,7 +5210,7 @@ impl SqliteStorage {
     pub fn get_active_issues_metadata(
         &self,
     ) -> Result<std::collections::HashMap<String, (String, i32, String)>> {
-        let sql = "SELECT id, title, priority, status FROM issues WHERE status IN ('open', 'in_progress', 'blocked')";
+        let sql = "SELECT id, title, priority, status FROM issues WHERE status != 'tombstone'";
         let rows = self.conn.query(sql)?;
 
         let mut map = std::collections::HashMap::with_capacity(rows.len());

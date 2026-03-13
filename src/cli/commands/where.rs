@@ -6,6 +6,8 @@ use crate::error::BeadsError;
 use crate::error::Result;
 use crate::output::OutputContext;
 use crate::util::parse_id;
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fs::File;
@@ -67,7 +69,7 @@ fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput
     let paths = config::resolve_paths(&final_dir, cli.db.as_ref())?;
     let database_path = canonicalize_lossy(&paths.db_path).display().to_string();
     let jsonl_path = canonicalize_lossy(&paths.jsonl_path).display().to_string();
-    let prefix = detect_prefix(&final_dir, &paths.jsonl_path, cli);
+    let prefix = detect_prefix(&final_dir, &paths.db_path, &paths.jsonl_path, cli);
 
     Ok(Some(WhereOutput {
         path: canonicalize_lossy(&final_dir).display().to_string(),
@@ -80,45 +82,67 @@ fn resolve_where_output(cli: &config::CliOverrides) -> Result<Option<WhereOutput
 
 fn detect_prefix(
     beads_dir: &Path,
+    db_path: &Path,
     jsonl_path: &Path,
     cli: &config::CliOverrides,
 ) -> Option<String> {
     if let Ok(startup) = config::load_startup_config_with_paths(beads_dir, cli.db.as_ref())
-        && let Some(prefix) = startup
-            .merged_config
-            .runtime
-            .get("issue_prefix")
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|prefix| !prefix.is_empty())
+        && let Some(prefix) =
+            config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
     {
-        return Some(prefix.to_string());
+        return Some(prefix);
     }
 
     match inspect_jsonl_prefix(jsonl_path) {
-        JsonlPrefixState::Detected(prefix) => return Some(prefix),
+        JsonlPrefixState::Detected(prefix) => {
+            return prefix_from_db_without_recovery(db_path).or(Some(prefix));
+        }
         JsonlPrefixState::Mixed => return None,
         JsonlPrefixState::Missing => {}
     }
 
-    if let Ok(storage_ctx) = config::open_storage_with_cli(beads_dir, cli) {
-        if let Ok(config_layer) = storage_ctx.load_config(cli) {
-            let prefix = config::id_config_from_layer(&config_layer).prefix;
-            if !prefix.trim().is_empty() {
-                return Some(prefix);
-            }
-        }
+    prefix_from_db_without_recovery(db_path)
+}
 
-        if let Ok(ids) = storage_ctx.storage.get_all_ids()
-            && let Some(prefix) = ids
-                .first()
-                .and_then(|id| parse_id(id).ok().map(|parsed| parsed.prefix))
-        {
-            return Some(prefix);
-        }
+fn prefix_from_db_without_recovery(db_path: &Path) -> Option<String> {
+    if !db_path.is_file() {
+        return None;
     }
 
-    None
+    config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+
+        if let Ok(rows) = conn.query(
+            "SELECT value FROM config \
+             WHERE key IN ('issue_prefix', 'issue-prefix', 'prefix') \
+             ORDER BY CASE key \
+                 WHEN 'issue_prefix' THEN 0 \
+                 WHEN 'issue-prefix' THEN 1 \
+                 ELSE 2 \
+             END \
+             LIMIT 1",
+        ) && let Some(prefix) = rows
+            .first()
+            .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+        {
+            return Ok(Some(prefix.to_string()));
+        }
+
+        Ok(conn
+            .query("SELECT id FROM issues ORDER BY rowid LIMIT 1")
+            .ok()
+            .and_then(|rows| rows.first().cloned())
+            .and_then(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix)))
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
@@ -254,7 +278,6 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::CliOverrides;
-    use crate::error::BeadsError;
     use crate::storage::SqliteStorage;
     use std::env;
     use std::fs;
@@ -367,14 +390,67 @@ mod tests {
     }
 
     #[test]
-    fn resolve_where_output_surfaces_invalid_db_override() {
+    fn resolve_where_output_does_not_create_missing_db() {
+        let _lock = TEST_DIR_LOCK.lock().expect("test dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("workspace");
+        let beads_dir = root.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&CliOverrides::default())
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(
+            output.database_path,
+            Some(
+                canonicalize_lossy(&beads_dir.join("beads.db"))
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            !beads_dir.join("beads.db").exists(),
+            "where must not create the database as a side effect"
+        );
+    }
+
+    #[test]
+    fn resolve_where_output_falls_back_for_external_db_override() {
+        let _lock = TEST_DIR_LOCK.lock().expect("test dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("workspace");
+        let beads_dir = root.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let external_db = temp.path().join("cache").join("custom.db");
         let cli = CliOverrides {
-            db: Some(PathBuf::from("/tmp/not-a-beads-db")),
+            db: Some(external_db.clone()),
             ..CliOverrides::default()
         };
 
-        let err = resolve_where_output(&cli).expect_err("invalid db override should error");
-        assert!(matches!(err, BeadsError::Validation { .. }));
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&cli)
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(
+            output.path,
+            canonicalize_lossy(&beads_dir).display().to_string()
+        );
+        assert_eq!(
+            output.database_path,
+            Some(canonicalize_lossy(&external_db).display().to_string())
+        );
+        assert_eq!(
+            output.jsonl_path,
+            Some(
+                canonicalize_lossy(&temp.path().join("cache").join("issues.jsonl"))
+                    .display()
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -437,8 +513,44 @@ mod tests {
         .expect("write mixed-prefix jsonl");
 
         assert_eq!(
-            detect_prefix(&beads_dir, &jsonl_path, &CliOverrides::default()),
+            detect_prefix(&beads_dir, &db_path, &jsonl_path, &CliOverrides::default()),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_where_output_accepts_startup_prefix_alias() {
+        let _lock = TEST_DIR_LOCK.lock().expect("test dir lock");
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("workspace");
+        let beads_dir = root.join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(beads_dir.join("config.yaml"), "prefix: proj\n").expect("write config");
+
+        let _guard = DirGuard::new(&root);
+        let output = resolve_where_output(&CliOverrides::default())
+            .expect("where output")
+            .expect("workspace output");
+
+        assert_eq!(output.prefix.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn detect_prefix_prefers_db_prefix_over_jsonl_inference() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("open db");
+        storage.set_config("prefix", "dbpref").expect("set prefix");
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, r#"{"id":"jsonl-abc12","title":"Example"}"#).expect("write jsonl");
+
+        assert_eq!(
+            detect_prefix(&beads_dir, &db_path, &jsonl_path, &CliOverrides::default()),
+            Some("dbpref".to_string())
         );
     }
 }

@@ -14,7 +14,11 @@
     },
     {
       "surface": "doctor",
-      "outcome": "doctor_clean"
+      "outcome": "reports_errors"
+    },
+    {
+      "surface": "doctor --repair",
+      "outcome": "repair_applied"
     },
     {
       "surface": "sync --status",

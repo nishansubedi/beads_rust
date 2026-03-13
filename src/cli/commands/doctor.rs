@@ -16,7 +16,8 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::fs::File;
+use std::collections::BTreeSet;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -59,12 +60,59 @@ struct DoctorRun {
     jsonl_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 struct LocalRepairResult {
     blocked_cache_rebuilt: bool,
+    wal_checkpoint_completed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    quarantined_artifacts: Vec<String>,
 }
 
 const BLOCKED_CACHE_STALE_FINDING: &str = "blocked_issues_cache is marked stale and needs rebuild";
+
+#[derive(Debug, Default)]
+struct SidecarInspection {
+    findings: Vec<String>,
+    quarantine_candidates: Vec<PathBuf>,
+    wal_requires_reconciliation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemPathKind {
+    Missing,
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+impl LocalRepairResult {
+    fn applied(&self) -> bool {
+        self.blocked_cache_rebuilt
+            || self.wal_checkpoint_completed
+            || !self.quarantined_artifacts.is_empty()
+    }
+}
+
+impl FilesystemPathKind {
+    fn exists(self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    fn is_regular_file(self) -> bool {
+        matches!(self, Self::File)
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::File => "regular file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Other => "special filesystem entry",
+        }
+    }
+}
 
 fn push_check(
     checks: &mut Vec<CheckResult>,
@@ -114,6 +162,205 @@ fn report_has_blocked_cache_stale_finding(report: &DoctorReport) -> bool {
                 })
             })
     })
+}
+
+fn report_has_sidecar_anomaly(report: &DoctorReport) -> bool {
+    report
+        .checks
+        .iter()
+        .any(|check| check.name == "db.sidecars" && matches!(check.status, CheckStatus::Error))
+}
+
+fn local_repair_message(local_repair: &LocalRepairResult) -> String {
+    let mut actions = Vec::new();
+    if local_repair.blocked_cache_rebuilt {
+        actions.push("rebuilt the stale blocked cache".to_string());
+    }
+    if local_repair.wal_checkpoint_completed {
+        actions.push("checkpointed database WAL state".to_string());
+    }
+    if !local_repair.quarantined_artifacts.is_empty() {
+        actions.push(format!(
+            "quarantined {} anomalous database artifact(s)",
+            local_repair.quarantined_artifacts.len()
+        ));
+    }
+
+    if actions.is_empty() {
+        "No remaining errors detected after recoverable-state repair.".to_string()
+    } else {
+        format!("Repair complete: {}.", actions.join("; "))
+    }
+}
+
+fn classify_path_kind(path: &Path) -> Result<FilesystemPathKind> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(FilesystemPathKind::Symlink),
+        Ok(metadata) if metadata.is_file() => Ok(FilesystemPathKind::File),
+        Ok(metadata) if metadata.is_dir() => Ok(FilesystemPathKind::Directory),
+        Ok(_) => Ok(FilesystemPathKind::Other),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(FilesystemPathKind::Missing),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn database_sidecar_paths(db_path: &Path) -> [(PathBuf, &'static str); 3] {
+    let db_string = db_path.to_string_lossy();
+    [
+        (PathBuf::from(format!("{db_string}-wal")), "WAL"),
+        (PathBuf::from(format!("{db_string}-shm")), "SHM"),
+        (
+            PathBuf::from(format!("{db_string}-journal")),
+            "rollback journal",
+        ),
+    ]
+}
+
+fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
+    let db_kind = classify_path_kind(db_path)?;
+    let mut inspection = SidecarInspection::default();
+    let mut wal_kind = FilesystemPathKind::Missing;
+    let mut shm_kind = FilesystemPathKind::Missing;
+
+    for (path, label) in database_sidecar_paths(db_path) {
+        let kind = classify_path_kind(&path)?;
+        match label {
+            "WAL" => wal_kind = kind,
+            "SHM" => shm_kind = kind,
+            _ => {}
+        }
+
+        if kind.exists() && !db_kind.is_regular_file() {
+            inspection.quarantine_candidates.push(path.clone());
+        }
+
+        if kind.exists() && !kind.is_regular_file() {
+            inspection.findings.push(format!(
+                "{label} sidecar at {} is a {} instead of a regular file",
+                path.display(),
+                kind.description()
+            ));
+            inspection.quarantine_candidates.push(path);
+        }
+    }
+
+    if wal_kind.is_regular_file() && !shm_kind.exists() {
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        inspection.findings.push(format!(
+            "WAL sidecar exists without a matching SHM sidecar at {}",
+            wal_path.display()
+        ));
+        inspection.wal_requires_reconciliation = true;
+        inspection.quarantine_candidates.push(wal_path);
+    }
+
+    if shm_kind.is_regular_file() && !wal_kind.exists() {
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        inspection.findings.push(format!(
+            "SHM sidecar exists without a matching WAL sidecar at {}",
+            shm_path.display()
+        ));
+        inspection.quarantine_candidates.push(shm_path);
+    }
+
+    if !db_kind.is_regular_file() {
+        let has_dangling_sidecars = database_sidecar_paths(db_path)
+            .into_iter()
+            .any(|(path, _)| {
+                classify_path_kind(&path)
+                    .ok()
+                    .is_some_and(FilesystemPathKind::exists)
+            });
+        if has_dangling_sidecars {
+            inspection.findings.push(format!(
+                "Database sidecars exist even though the primary database at {} is a {}",
+                db_path.display(),
+                db_kind.description()
+            ));
+        }
+    }
+
+    inspection.quarantine_candidates.sort();
+    inspection.quarantine_candidates.dedup();
+    Ok(inspection)
+}
+
+fn check_database_sidecars(db_path: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
+    let inspection = inspect_database_sidecars(db_path)?;
+    if inspection.findings.is_empty() {
+        push_check(checks, "db.sidecars", CheckStatus::Ok, None, None);
+        return Ok(());
+    }
+
+    push_check(
+        checks,
+        "db.sidecars",
+        CheckStatus::Error,
+        Some(inspection.findings[0].clone()),
+        Some(serde_json::json!({
+            "findings": inspection.findings,
+            "quarantine_candidates": inspection
+                .quarantine_candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        })),
+    );
+    Ok(())
+}
+
+fn check_recovery_artifacts(
+    beads_dir: &Path,
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
+    let db_prefix = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("beads.db");
+    let db_parent = db_path.parent().unwrap_or(beads_dir);
+    let mut artifacts = Vec::new();
+
+    if recovery_dir.is_dir() {
+        for entry in fs::read_dir(&recovery_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(db_prefix) {
+                artifacts.push(entry.path().display().to_string());
+            }
+        }
+    }
+
+    for entry in fs::read_dir(db_parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!("{db_prefix}.bad_")) {
+            artifacts.push(entry.path().display().to_string());
+        }
+    }
+
+    artifacts.sort();
+    artifacts.dedup();
+
+    if artifacts.is_empty() {
+        push_check(checks, "db.recovery_artifacts", CheckStatus::Ok, None, None);
+    } else {
+        push_check(
+            checks,
+            "db.recovery_artifacts",
+            CheckStatus::Warn,
+            Some(format!(
+                "Preserved recovery artifacts remain for this database family ({} item(s))",
+                artifacts.len()
+            )),
+            Some(serde_json::json!({ "artifacts": artifacts })),
+        );
+    }
+
+    Ok(())
 }
 
 fn push_inspection_error(
@@ -240,37 +487,136 @@ fn repair_database_from_jsonl(
     })
 }
 
-fn repair_recoverable_db_state(db_path: &Path) -> LocalRepairResult {
-    if !db_path.exists() {
+fn repair_recoverable_db_state(
+    beads_dir: &Path,
+    db_path: &Path,
+    report: &DoctorReport,
+) -> LocalRepairResult {
+    let mut repair = LocalRepairResult::default();
+
+    if report_has_sidecar_anomaly(report) {
+        repair_database_sidecars(beads_dir, db_path, &mut repair);
+    }
+
+    if !db_path.is_file() {
         tracing::debug!(
             path = %db_path.display(),
-            "Skipping local recoverable-state repair because the database file is missing"
+            "Skipping blocked-cache repair because the database file is missing"
         );
-        return LocalRepairResult::default();
+        return repair;
     }
 
     match SqliteStorage::open(db_path) {
         Ok(storage) => match storage.ensure_blocked_cache_fresh() {
-            Ok(blocked_cache_rebuilt) => LocalRepairResult {
-                blocked_cache_rebuilt,
-            },
+            Ok(blocked_cache_rebuilt) => {
+                repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
+                repair
+            }
             Err(err) => {
                 tracing::warn!(
                     path = %db_path.display(),
                     error = %err,
-                    "Skipping local recoverable-state repair; falling back to JSONL rebuild"
+                    "Skipping blocked-cache repair; falling back to JSONL rebuild"
                 );
-                LocalRepairResult::default()
+                repair
             }
         },
         Err(err) => {
             tracing::warn!(
                 path = %db_path.display(),
                 error = %err,
-                "Skipping local recoverable-state repair because the database could not be opened"
+                "Skipping blocked-cache repair because the database could not be opened"
             );
-            LocalRepairResult::default()
+            repair
         }
+    }
+}
+
+fn repair_database_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
+    match inspect_database_sidecars(db_path) {
+        Ok(initial_inspection) => {
+            checkpoint_anomalous_wal(db_path, &initial_inspection, repair);
+            quarantine_anomalous_sidecars(beads_dir, db_path, repair);
+        }
+        Err(err) => tracing::warn!(
+            path = %db_path.display(),
+            error = %err,
+            "Skipping sidecar repair because filesystem inspection failed"
+        ),
+    }
+}
+
+fn checkpoint_anomalous_wal(
+    db_path: &Path,
+    inspection: &SidecarInspection,
+    repair: &mut LocalRepairResult,
+) {
+    if !inspection.wal_requires_reconciliation || !db_path.is_file() {
+        return;
+    }
+
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => match storage.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)") {
+            Ok(()) => repair.wal_checkpoint_completed = true,
+            Err(err) => tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Failed to checkpoint anomalous WAL sidecar before quarantine"
+            ),
+        },
+        Err(err) => tracing::warn!(
+            path = %db_path.display(),
+            error = %err,
+            "Failed to open database while reconciling anomalous sidecars"
+        ),
+    }
+}
+
+fn quarantine_anomalous_sidecars(beads_dir: &Path, db_path: &Path, repair: &mut LocalRepairResult) {
+    match inspect_database_sidecars(db_path) {
+        Ok(post_checkpoint_inspection) => {
+            let mut quarantine_paths: BTreeSet<_> = post_checkpoint_inspection
+                .quarantine_candidates
+                .into_iter()
+                .collect();
+            let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+
+            if post_checkpoint_inspection.wal_requires_reconciliation
+                && !repair.wal_checkpoint_completed
+                && quarantine_paths.remove(&wal_path)
+            {
+                tracing::warn!(
+                    path = %wal_path.display(),
+                    "Skipping WAL quarantine because checkpoint reconciliation did not succeed"
+                );
+            }
+
+            if !quarantine_paths.is_empty() {
+                match config::quarantine_database_artifacts(
+                    db_path,
+                    beads_dir,
+                    quarantine_paths,
+                    "doctor-quarantine",
+                ) {
+                    Ok(quarantined) => {
+                        repair.quarantined_artifacts = quarantined
+                            .into_iter()
+                            .map(|path| path.display().to_string())
+                            .collect();
+                    }
+                    Err(err) => tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "Failed to quarantine anomalous database sidecar artifacts"
+                    ),
+                }
+            }
+        }
+        Err(err) => tracing::warn!(
+            path = %db_path.display(),
+            error = %err,
+            "Failed to re-inspect database sidecars after local repair"
+        ),
     }
 }
 
@@ -704,6 +1050,24 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
         update_result,
         rollback_result,
     ));
+}
+
+fn check_live_issue_write_probe(db_path: &Path, checks: &mut Vec<CheckResult>) {
+    match Connection::open(db_path.to_string_lossy().into_owned()) {
+        Ok(conn) => {
+            let _ = conn.execute("PRAGMA busy_timeout=0");
+            check_issue_write_probe(&conn, checks);
+        }
+        Err(err) => push_check(
+            checks,
+            "db.write_probe",
+            CheckStatus::Error,
+            Some(format!(
+                "Failed to open live DB for rollback-only write probe: {err}"
+            )),
+            Some(serde_json::json!({ "path": db_path.display().to_string() })),
+        ),
+    }
 }
 
 fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
@@ -1341,19 +1705,41 @@ fn check_sync_metadata(
 
 fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Result<DoctorRun> {
     let mut checks = Vec::new();
-
     check_merge_artifacts(beads_dir, &mut checks)?;
 
+    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
+    inspect_doctor_database(
+        beads_dir,
+        &paths.db_path,
+        jsonl_path.as_deref(),
+        jsonl_count,
+        &mut checks,
+    );
+
+    Ok(DoctorRun {
+        report: DoctorReport {
+            ok: !has_error(&checks),
+            checks,
+        },
+        jsonl_path,
+    })
+}
+
+fn inspect_doctor_jsonl(
+    beads_dir: &Path,
+    paths: &config::ConfigPaths,
+    checks: &mut Vec<CheckResult>,
+) -> (Option<PathBuf>, Option<usize>) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
-        check_sync_jsonl_path(path, beads_dir, &mut checks);
-        check_sync_conflict_markers(path, &mut checks);
+        check_sync_jsonl_path(path, beads_dir, checks);
+        check_sync_conflict_markers(path, checks);
 
-        match check_jsonl(path, &mut checks) {
+        match check_jsonl(path, checks) {
             Ok(count) => Some(count),
             Err(err) => {
                 push_check(
-                    &mut checks,
+                    checks,
                     "jsonl.parse",
                     CheckStatus::Error,
                     Some(format!("Failed to read JSONL: {err}")),
@@ -1364,7 +1750,7 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         }
     } else {
         push_check(
-            &mut checks,
+            checks,
             "jsonl.parse",
             CheckStatus::Warn,
             Some("No JSONL file found (.beads/issues.jsonl or .beads/beads.jsonl)".to_string()),
@@ -1373,68 +1759,98 @@ fn collect_doctor_report(beads_dir: &Path, paths: &config::ConfigPaths) -> Resul
         None
     };
 
-    let db_path = paths.db_path.clone();
+    (jsonl_path, jsonl_count)
+}
+
+fn inspect_doctor_database(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: Option<&Path>,
+    jsonl_count: Option<usize>,
+    checks: &mut Vec<CheckResult>,
+) {
+    if let Err(err) = check_recovery_artifacts(beads_dir, db_path, checks) {
+        push_inspection_error(
+            checks,
+            "db.recovery_artifacts",
+            "Failed to inspect preserved recovery artifacts",
+            &err,
+        );
+    }
+    if let Err(err) = check_database_sidecars(db_path, checks) {
+        push_inspection_error(
+            checks,
+            "db.sidecars",
+            "Failed to inspect database sidecars",
+            &err,
+        );
+    }
+
     if db_path.exists() {
-        match Connection::open(db_path.to_string_lossy().into_owned()) {
-            Ok(conn) => {
-                let _ = conn.execute("PRAGMA busy_timeout=30000");
-                if let Err(err) = required_schema_checks(&conn, &mut checks) {
-                    push_inspection_error(
-                        &mut checks,
-                        "schema.inspect",
-                        "Failed to inspect database schema",
-                        &err,
-                    );
-                }
-                if let Err(err) = check_recoverable_anomalies(&conn, &mut checks) {
-                    push_inspection_error(
-                        &mut checks,
-                        "db.recoverable_anomalies",
-                        "Failed to inspect recoverable anomalies",
-                        &err,
-                    );
-                }
-                check_integrity(&conn, &mut checks);
-                check_issue_write_probe(&conn, &mut checks);
-                if let Err(err) = check_db_count(&conn, jsonl_count, &mut checks) {
-                    push_inspection_error(
-                        &mut checks,
-                        "counts.db_vs_jsonl",
-                        "Failed to compare database and JSONL counts",
-                        &err,
-                    );
-                }
-                check_sync_metadata(&conn, &db_path, jsonl_path.as_deref(), &mut checks);
-                check_sqlite_cli_integrity(&db_path, &mut checks);
-            }
-            Err(err) => {
-                push_check(
-                    &mut checks,
-                    "db.open",
-                    CheckStatus::Error,
-                    Some(format!("Failed to open DB read-only: {err}")),
-                    Some(serde_json::json!({ "path": db_path.display().to_string() })),
-                );
-                check_sqlite_cli_integrity(&db_path, &mut checks);
-            }
-        }
+        inspect_existing_doctor_database(db_path, jsonl_path, jsonl_count, checks);
     } else {
         push_check(
-            &mut checks,
+            checks,
             "db.exists",
             CheckStatus::Error,
             Some(format!("Missing database file at {}", db_path.display())),
             Some(serde_json::json!({ "path": db_path.display().to_string() })),
         );
     }
+}
 
-    Ok(DoctorRun {
-        report: DoctorReport {
-            ok: !has_error(&checks),
-            checks,
-        },
-        jsonl_path,
-    })
+fn inspect_existing_doctor_database(
+    db_path: &Path,
+    jsonl_path: Option<&Path>,
+    jsonl_count: Option<usize>,
+    checks: &mut Vec<CheckResult>,
+) {
+    match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+        let _ = conn.execute("PRAGMA busy_timeout=30000");
+        if let Err(err) = required_schema_checks(&conn, checks) {
+            push_inspection_error(
+                checks,
+                "schema.inspect",
+                "Failed to inspect database schema",
+                &err,
+            );
+        }
+        if let Err(err) = check_recoverable_anomalies(&conn, checks) {
+            push_inspection_error(
+                checks,
+                "db.recoverable_anomalies",
+                "Failed to inspect recoverable anomalies",
+                &err,
+            );
+        }
+        check_integrity(&conn, checks);
+        if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
+            push_inspection_error(
+                checks,
+                "counts.db_vs_jsonl",
+                "Failed to compare database and JSONL counts",
+                &err,
+            );
+        }
+        check_sync_metadata(&conn, snapshot_db_path, jsonl_path, checks);
+        Ok(())
+    }) {
+        Ok(()) => {
+            check_live_issue_write_probe(db_path, checks);
+            check_sqlite_cli_integrity(db_path, checks);
+        }
+        Err(err) => {
+            push_check(
+                checks,
+                "db.open",
+                CheckStatus::Error,
+                Some(format!("Failed to open DB snapshot for inspection: {err}")),
+                Some(serde_json::json!({ "path": db_path.display().to_string() })),
+            );
+            check_sqlite_cli_integrity(db_path, checks);
+        }
+    }
 }
 
 /// Execute the doctor command.
@@ -1505,38 +1921,35 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
-    let local_repair = if report_has_blocked_cache_stale_finding(&initial.report) {
-        repair_recoverable_db_state(&paths.db_path)
+    let local_repair = if report_has_blocked_cache_stale_finding(&initial.report)
+        || report_has_sidecar_anomaly(&initial.report)
+    {
+        repair_recoverable_db_state(&beads_dir, &paths.db_path, &initial.report)
     } else {
         LocalRepairResult::default()
     };
-    let after_local_repair = if local_repair.blocked_cache_rebuilt {
+    let after_local_repair = if local_repair.applied() {
         collect_doctor_report(&beads_dir, &paths)?
     } else {
         initial.clone()
     };
 
     if after_local_repair.report.ok {
+        let repair_message = local_repair_message(&local_repair);
         if ctx.is_json() {
             ctx.json(&serde_json::json!({
                 "report": initial.report,
-                "repaired": local_repair.blocked_cache_rebuilt,
+                "repaired": local_repair.applied(),
                 "local_repair": local_repair,
-                "message": if local_repair.blocked_cache_rebuilt {
-                    "Repair complete: rebuilt stale blocked cache."
-                } else {
-                    "No remaining errors detected after recoverable-state repair."
-                },
+                "message": repair_message,
                 "post_repair": after_local_repair.report,
                 "verified": true,
             }));
         } else {
             print_report(&initial.report, ctx)?;
-            if local_repair.blocked_cache_rebuilt {
-                ctx.info("Repair complete: rebuilt stale blocked cache.");
-                ctx.info("Post-repair verification:");
-                print_report(&after_local_repair.report, ctx)?;
-            }
+            ctx.info(&repair_message);
+            ctx.info("Post-repair verification:");
+            print_report(&after_local_repair.report, ctx)?;
         }
         return Ok(());
     }
@@ -1908,6 +2321,142 @@ mod tests {
     }
 
     #[test]
+    fn test_check_database_sidecars_detects_wal_without_shm() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        fs::write(&db_path, b"sqlite-header-placeholder")?;
+        fs::write(
+            PathBuf::from(format!("{}-wal", db_path.to_string_lossy())),
+            b"synthetic wal",
+        )?;
+
+        let mut checks = Vec::new();
+        check_database_sidecars(&db_path, &mut checks)?;
+
+        let check = find_check(&checks, "db.sidecars").expect("sidecar check");
+        assert!(matches!(check.status, CheckStatus::Error));
+        assert!(
+            check.message.as_deref().is_some_and(|message| {
+                message.contains("WAL sidecar exists without a matching SHM sidecar")
+            }),
+            "unexpected sidecar message: {:?}",
+            check.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_recovery_artifacts_warns_on_preserved_database_family() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir)?;
+        fs::write(beads_dir.join("beads.db.bad_20260312T000000Z"), b"backup")?;
+        let recovery_dir = config::recovery_dir_for_db_path(&db_path, &beads_dir);
+        fs::create_dir_all(&recovery_dir)?;
+        fs::write(
+            recovery_dir.join("beads.db.20260312T000000Z.rebuild-failed"),
+            b"preserved",
+        )?;
+
+        let mut checks = Vec::new();
+        check_recovery_artifacts(&beads_dir, &db_path, &mut checks)?;
+
+        let check = find_check(&checks, "db.recovery_artifacts").expect("recovery artifact check");
+        assert!(matches!(check.status, CheckStatus::Warn));
+        let artifacts = check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("artifacts"))
+            .and_then(serde_json::Value::as_array)
+            .expect("artifact list");
+        assert_eq!(artifacts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_quarantines_orphan_shm_sidecar() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir)?;
+        let db_path = beads_dir.join("beads.db");
+        {
+            let _storage = SqliteStorage::open(&db_path)?;
+        }
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(&shm_path);
+        fs::write(&shm_path, b"orphan shm")?;
+
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "db.sidecars".to_string(),
+                status: CheckStatus::Error,
+                message: Some("SHM sidecar exists without a matching WAL sidecar".to_string()),
+                details: None,
+            }],
+        };
+
+        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
+        assert!(
+            !repair.quarantined_artifacts.is_empty(),
+            "expected local repair to quarantine the orphan SHM sidecar"
+        );
+
+        let recovery_dir = config::recovery_dir_for_db_path(&db_path, &beads_dir);
+        let backups: Vec<_> = fs::read_dir(&recovery_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            backups
+                .iter()
+                .any(|name| name.starts_with("beads.db-shm.")
+                    && name.ends_with(".doctor-quarantine")),
+            "expected quarantined SHM backup in recovery dir: {backups:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_preserves_orphan_wal_when_checkpoint_fails() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir)?;
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"not a sqlite database")?;
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        fs::write(&wal_path, b"orphan wal")?;
+
+        let report = DoctorReport {
+            ok: false,
+            checks: vec![CheckResult {
+                name: "db.sidecars".to_string(),
+                status: CheckStatus::Error,
+                message: Some("WAL sidecar exists without a matching SHM sidecar".to_string()),
+                details: None,
+            }],
+        };
+
+        let repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
+        assert!(
+            !repair.wal_checkpoint_completed,
+            "checkpoint should not succeed against an invalid database"
+        );
+        assert!(
+            repair.quarantined_artifacts.is_empty(),
+            "orphan WAL should remain in place when checkpoint reconciliation fails"
+        );
+        assert!(
+            wal_path.exists(),
+            "orphan WAL should not be quarantined after failed reconciliation"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_report_has_blocked_cache_stale_finding_detects_detail_entry() {
         let report = DoctorReport {
             ok: false,
@@ -1973,6 +2522,43 @@ mod tests {
             "unexpected check message: {:?}",
             check.message
         );
+    }
+
+    #[test]
+    fn test_inspect_existing_doctor_database_uses_live_write_probe() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-probe", "Probe me"), "tester")
+                .unwrap();
+        }
+
+        let lock_conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE").unwrap();
+
+        let mut checks = Vec::new();
+        inspect_existing_doctor_database(&db_path, None, None, &mut checks);
+
+        let check = find_check(&checks, "db.write_probe").expect("check present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn),
+            "unexpected live write probe status: {:?}",
+            check.status
+        );
+        assert!(
+            check.message.as_deref().is_some_and(|message| {
+                message.contains("Failed to begin rollback-only write probe")
+            }),
+            "unexpected check message: {:?}",
+            check.message
+        );
+
+        lock_conn.execute("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -2177,9 +2763,15 @@ mod tests {
     #[test]
     fn test_repair_recoverable_db_state_skips_missing_db() {
         let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
         let db_path = temp.path().join("missing.db");
+        let report = DoctorReport {
+            ok: false,
+            checks: Vec::new(),
+        };
 
-        let local_repair = repair_recoverable_db_state(&db_path);
+        let local_repair = repair_recoverable_db_state(&beads_dir, &db_path, &report);
         assert!(!local_repair.blocked_cache_rebuilt);
     }
 }

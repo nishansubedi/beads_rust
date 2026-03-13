@@ -33,7 +33,7 @@ fn test_auto_flush_optimizes_no_content_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush (should export)
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
     assert!(result.flushed, "First flush should happen");
     assert_eq!(result.exported_count, 1);
 
@@ -65,7 +65,7 @@ fn test_auto_flush_optimizes_no_content_change() {
 
     // 4. Second auto-flush should now skip the rewrite because the exported JSONL
     // would be byte-identical.
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
 
     assert!(
         !result.flushed,
@@ -92,7 +92,7 @@ fn test_auto_flush_flush_on_label_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
     assert!(result.flushed);
 
     // 3. Add a label
@@ -103,7 +103,7 @@ fn test_auto_flush_flush_on_label_change() {
     assert_eq!(dirty_ids.len(), 1);
 
     // 4. Second auto-flush - SHOULD FLUSH because label was added
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
 
     // This assertion will FAIL if my optimization is active and flawed
     assert!(result.flushed, "Should flush when label is added");
@@ -120,7 +120,7 @@ fn test_auto_flush_uses_resolved_jsonl_path() {
     let mut storage = SqliteStorage::open(&db_path).unwrap();
     storage.create_issue(&make_issue("bd-1"), "tester").unwrap();
 
-    let result = auto_flush(&mut storage, &beads_dir, &custom_jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &custom_jsonl_path, false).unwrap();
 
     assert!(result.flushed);
     assert!(custom_jsonl_path.exists());
@@ -137,7 +137,7 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
 
     let mut storage = SqliteStorage::open(&db_path).unwrap();
     storage.create_issue(&make_issue("bd-1"), "tester").unwrap();
-    auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
 
     let extra_issue = make_issue("bd-extra");
     let mut contents = fs::read_to_string(&jsonl_path).unwrap();
@@ -158,7 +158,7 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
         )
         .unwrap();
 
-    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
     assert!(result.flushed);
 
     let issues = beads_rust::sync::read_issues_from_jsonl(&jsonl_path).unwrap();

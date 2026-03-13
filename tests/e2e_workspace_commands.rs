@@ -529,6 +529,105 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
     );
 }
 
+#[test]
+fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
+    let _log = common::test_log("e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar");
+    let seed_sidecar_anomaly =
+        |workspace: &BrWorkspace, label_prefix: &str| -> std::path::PathBuf {
+            let init = run_br(workspace, ["init"], &format!("{label_prefix}_init"));
+            assert!(init.status.success(), "init failed: {}", init.stderr);
+
+            let create = run_br(
+                workspace,
+                ["create", "Repair doctor anomalous sidecar"],
+                &format!("{label_prefix}_create"),
+            );
+            assert!(create.status.success(), "create failed: {}", create.stderr);
+
+            let beads_dir = workspace.root.join(".beads");
+            let wal_path = beads_dir.join("beads.db-wal");
+            fs::write(&wal_path, b"synthetic orphan wal").expect("seed anomalous wal");
+            assert!(
+                !beads_dir.join("beads.db-shm").exists(),
+                "fixture should keep the WAL anomaly isolated to a missing SHM sidecar"
+            );
+            wal_path
+        };
+
+    let detect_workspace = BrWorkspace::new();
+    let _detect_wal_path = seed_sidecar_anomaly(&detect_workspace, "detect");
+
+    let doctor = run_br(
+        &detect_workspace,
+        ["doctor", "--json"],
+        "doctor_sidecar_json",
+    );
+    assert!(
+        !doctor.status.success(),
+        "doctor should fail when anomalous sidecars are present"
+    );
+    let doctor_json: Value =
+        serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor json");
+    assert_eq!(doctor_json["ok"], Value::Bool(false));
+    assert!(
+        doctor_json["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"] == "db.sidecars"
+                    && check["status"] == "error"
+                    && check["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("matching SHM sidecar"))
+            })),
+        "doctor should surface the sidecar anomaly: {doctor_json}"
+    );
+
+    let repair_workspace = BrWorkspace::new();
+    let wal_path = seed_sidecar_anomaly(&repair_workspace, "repair");
+    let repair_beads_dir = repair_workspace.root.join(".beads");
+
+    let repaired = run_br(
+        &repair_workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair_sidecar_json",
+    );
+    assert!(
+        repaired.status.success(),
+        "doctor --repair --json failed for anomalous sidecar: stdout='{}' stderr='{}'",
+        repaired.stdout,
+        repaired.stderr
+    );
+
+    let repaired_json: Value =
+        serde_json::from_str(&extract_json_payload(&repaired.stdout)).expect("repair doctor json");
+    assert_eq!(repaired_json["repaired"], Value::Bool(true));
+    assert_eq!(repaired_json["verified"], Value::Bool(true));
+    assert_eq!(repaired_json["post_repair"]["ok"], Value::Bool(true));
+    assert!(
+        repaired_json["local_repair"]["quarantined_artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| !artifacts.is_empty()),
+        "repair should preserve anomalous sidecars in recovery: {repaired_json}"
+    );
+    assert!(
+        !wal_path.exists(),
+        "anomalous WAL should be moved out of the live database family"
+    );
+
+    let recovery_dir = repair_beads_dir.join(".br_recovery");
+    let recovery_entries: Vec<_> = fs::read_dir(&recovery_dir)
+        .expect("read recovery dir")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        recovery_entries
+            .iter()
+            .any(|name| name.starts_with("beads.db-wal.") && name.ends_with(".doctor-quarantine")),
+        "expected quarantined WAL artifact in recovery dir: {recovery_entries:?}"
+    );
+}
+
 // ============================================================================
 // info command tests
 // ============================================================================

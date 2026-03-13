@@ -11,9 +11,9 @@ use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, count_issues_in_jsonl,
-    export_temp_path, export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl,
-    import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, compute_staleness,
+    count_issues_in_jsonl, export_temp_path, export_to_jsonl_with_policy, finalize_export,
+    get_issue_ids_from_jsonl, import_from_jsonl, load_base_snapshot, read_issues_from_jsonl,
     require_safe_sync_overwrite_path, save_base_snapshot, three_way_merge,
     validate_sync_path_with_external,
 };
@@ -304,14 +304,14 @@ fn execute_status(
     use_json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let dirty_count = storage.get_dirty_issue_count()?;
-
     let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
     let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
     let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
 
     let jsonl_path = &path_policy.jsonl_path;
-    let jsonl_exists = jsonl_path.exists();
+    let staleness = compute_staleness(storage, jsonl_path)?;
+    let dirty_count = staleness.dirty_count;
+    let jsonl_exists = staleness.jsonl_exists;
     debug!(
         jsonl_path = %jsonl_path.display(),
         jsonl_exists,
@@ -319,72 +319,20 @@ fn execute_status(
         "Computed sync status inputs"
     );
 
-    // Determine staleness using Lstat (symlink_metadata) to handle symlinks correctly
-    let (jsonl_newer, db_newer) = if jsonl_exists {
-        // Use symlink_metadata (Lstat) instead of metadata (stat) to get the mtime
-        // of the symlink itself, not the target. This is important for detecting
-        // when the JSONL file has been updated via a symlink.
-        let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
-
-        // JSONL is newer if it was modified after last import
-        let mtime_newer = last_import_time.as_ref().is_none_or(|import_time| {
-            chrono::DateTime::parse_from_rfc3339(import_time).is_ok_and(|import_ts| {
-                let import_sys_time = std::time::SystemTime::from(import_ts);
-                jsonl_mtime > import_sys_time
-            })
-        });
-
-        // Hash check prevents false staleness from `touch` - if mtime is newer but
-        // content hash is the same, the file wasn't actually modified
-        let jsonl_newer = if mtime_newer {
-            // Check if content hash has changed to prevent false positives from touch
-            jsonl_content_hash.as_ref().map_or_else(
-                || {
-                    // No stored hash (cold start), trust mtime
-                    debug!("No stored hash (cold start), trusting mtime for staleness");
-                    true
-                },
-                |stored_hash| match compute_jsonl_hash(jsonl_path) {
-                    Ok(current_hash) => {
-                        let hash_changed = &current_hash != stored_hash;
-                        debug!(
-                            mtime_newer,
-                            hash_changed,
-                            stored_hash,
-                            current_hash,
-                            "Staleness check: mtime newer but verifying hash"
-                        );
-                        hash_changed
-                    }
-                    Err(e) => {
-                        // If we can't compute hash, fall back to mtime-based staleness
-                        debug!(?e, "Failed to compute JSONL hash, falling back to mtime");
-                        true
-                    }
-                },
-            )
-        } else {
-            false
-        };
-
-        // DB is newer if there are dirty issues
-        let db_newer = dirty_count > 0;
-
-        (jsonl_newer, db_newer)
-    } else {
-        (false, dirty_count > 0)
-    };
-
     let status = SyncStatus {
         dirty_count,
         last_export_time,
         last_import_time,
         jsonl_content_hash,
         jsonl_exists,
-        jsonl_newer,
-        db_newer,
+        jsonl_newer: staleness.jsonl_newer,
+        db_newer: staleness.db_newer,
     };
-    debug!(jsonl_newer, db_newer, "Computed sync staleness");
+    debug!(
+        jsonl_newer = staleness.jsonl_newer,
+        db_newer = staleness.db_newer,
+        "Computed sync staleness"
+    );
 
     if use_json {
         // Print JSON directly so --robot works even if OutputContext is non-JSON.
@@ -522,13 +470,16 @@ fn execute_flush(
 
     // Check for dirty issues
     let dirty_ids = storage.get_dirty_issue_ids()?;
+    let needs_flush = storage.get_metadata("needs_flush")?.as_deref() == Some("true");
+    let jsonl_exists = jsonl_path.exists();
+    let db_issue_count = storage.count_issues()?;
     debug!(dirty_count = dirty_ids.len(), "Found dirty issues");
 
     // If no dirty issues and no force, report nothing to do
-    if dirty_ids.is_empty() && !args.force {
+    if dirty_ids.is_empty() && !needs_flush && jsonl_exists && !args.force {
         // Guard against empty DB overwriting a non-empty JSONL.
         let existing_count = count_issues_in_jsonl(jsonl_path)?;
-        if existing_count > 0 && storage.count_issues()? == 0 {
+        if existing_count > 0 && db_issue_count == 0 {
             warn!(
                 jsonl_count = existing_count,
                 "Refusing export of empty DB over non-empty JSONL"
@@ -566,7 +517,7 @@ fn execute_flush(
                      Database has {} issues, JSONL has {} unique issues.\n\
                      Export would lose {} issue(s): {}{}\n\
                      Hint: Run import first, or use --force to override.",
-                    db_ids.len(),
+                    db_issue_count,
                     jsonl_ids.len(),
                     missing_list.len(),
                     preview,
@@ -597,7 +548,7 @@ fn execute_flush(
 
     // Configure export
     let export_config = ExportConfig {
-        force: args.force,
+        force: args.force || (needs_flush && dirty_ids.is_empty()),
         is_default_path: true,
         error_policy: export_policy,
         retention_days,

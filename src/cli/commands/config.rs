@@ -17,6 +17,8 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde_json::json;
 use shell_words::split as split_shell_words;
@@ -30,6 +32,7 @@ use tracing::{debug, info, trace};
 #[derive(Debug, Clone, Copy)]
 enum ConfigSource {
     Default,
+    Jsonl,
     Db,
     LegacyUser,
     User,
@@ -42,6 +45,7 @@ impl ConfigSource {
     fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Jsonl => "jsonl inference",
             Self::Db => "db",
             Self::LegacyUser => "legacy user",
             Self::User => "user config",
@@ -54,6 +58,7 @@ impl ConfigSource {
     fn heading(self) -> &'static str {
         match self {
             Self::Default => "Default",
+            Self::Jsonl => "JSONL",
             Self::Db => "DB",
             Self::LegacyUser => "Legacy User",
             Self::User => "User",
@@ -122,11 +127,14 @@ fn build_layers(
     let defaults = default_config_layer();
     let db_overrides = overrides_without_no_db(overrides);
 
-    let db_layer = if let Some(dir) = beads_dir {
-        let storage_ctx = config::open_storage_with_cli(dir, &db_overrides)?;
-        ConfigLayer::from_db(&storage_ctx.storage)?
+    let (jsonl_inferred_layer, db_layer) = if let Some(dir) = beads_dir {
+        let paths = config::resolve_paths(dir, db_overrides.db.as_ref())?;
+        (
+            load_jsonl_inferred_layer(&paths)?,
+            load_db_layer_without_recovery(&paths),
+        )
     } else {
-        ConfigLayer::default()
+        (ConfigLayer::default(), ConfigLayer::default())
     };
 
     let legacy_user = load_legacy_user_config()?;
@@ -143,6 +151,10 @@ fn build_layers(
         LayerWithSource {
             source: ConfigSource::Default,
             layer: defaults,
+        },
+        LayerWithSource {
+            source: ConfigSource::Jsonl,
+            layer: jsonl_inferred_layer,
         },
         LayerWithSource {
             source: ConfigSource::Db,
@@ -169,6 +181,51 @@ fn build_layers(
             layer: cli_layer,
         },
     ])
+}
+
+fn load_jsonl_inferred_layer(paths: &ConfigPaths) -> Result<ConfigLayer> {
+    let mut layer = ConfigLayer::default();
+    if let Some(prefix) = config::first_prefix_from_jsonl(&paths.jsonl_path)? {
+        layer.runtime.insert("issue_prefix".to_string(), prefix);
+    }
+    Ok(layer)
+}
+
+fn load_db_layer_without_recovery(paths: &ConfigPaths) -> ConfigLayer {
+    if !paths.db_path.is_file() {
+        return ConfigLayer::default();
+    }
+
+    match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
+        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+        let rows = conn.query("SELECT key, value FROM config")?;
+        let mut layer = ConfigLayer::default();
+
+        for row in rows {
+            let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if config::is_startup_key(key) {
+                continue;
+            }
+            layer.runtime.insert(key.to_string(), value.to_string());
+        }
+
+        Ok(layer)
+    }) {
+        Ok(layer) => layer,
+        Err(err) => {
+            debug!(
+                path = %paths.db_path.display(),
+                error = %err,
+                "Skipping DB config layer because the database could not be snapshotted for read-only access"
+            );
+            ConfigLayer::default()
+        }
+    }
 }
 
 fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
@@ -1081,6 +1138,72 @@ mod tests {
 
         let contents = fs::read_to_string(&config_path).unwrap();
         assert!(!contents.contains("color"));
+    }
+
+    #[test]
+    fn test_build_layers_does_not_create_missing_db_for_read_only_access() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let layers = build_layers(Some(&beads_dir), &CliOverrides::default()).unwrap();
+
+        assert!(
+            !beads_dir.join("beads.db").exists(),
+            "config read paths must not create a database as a side effect"
+        );
+        assert!(!layers.is_empty());
+    }
+
+    #[test]
+    fn test_build_layers_reads_db_layer_from_startup_db_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join("config.yaml"), "db: custom.db\n").unwrap();
+
+        let db_path = crate::util::resolve_cache_dir(&beads_dir).join("custom.db");
+        let mut storage = crate::storage::SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("issue_prefix", "proj").unwrap();
+
+        let layers = build_layers(Some(&beads_dir), &CliOverrides::default()).unwrap();
+        let db_layer = layers
+            .iter()
+            .find(|layer| matches!(layer.source, ConfigSource::Db))
+            .expect("db layer");
+
+        assert_eq!(
+            db_layer
+                .layer
+                .runtime
+                .get("issue_prefix")
+                .map(String::as_str),
+            Some("proj")
+        );
+    }
+
+    #[test]
+    fn test_build_layers_infers_prefix_from_jsonl_for_read_only_config_views() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+        )
+        .unwrap();
+
+        let layers = build_layers(Some(&beads_dir), &CliOverrides::default()).unwrap();
+        let merged = merge_layers(&layers);
+
+        assert_eq!(
+            merged.runtime.get("issue_prefix").map(String::as_str),
+            Some("proj")
+        );
+        assert!(matches!(
+            resolve_source("issue_prefix", &layers),
+            ConfigSource::Jsonl
+        ));
     }
 
     #[test]

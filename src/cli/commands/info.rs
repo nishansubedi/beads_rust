@@ -4,27 +4,14 @@ use crate::cli::InfoArgs;
 use crate::config;
 use crate::error::Result;
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::SqliteStorage;
-use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::util::parse_id;
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-const SCHEMA_TABLES: &[&str] = &[
-    "issues",
-    "dependencies",
-    "labels",
-    "comments",
-    "events",
-    "config",
-    "metadata",
-    "dirty_issues",
-    "export_hashes",
-    "blocked_issues_cache",
-    "child_counters",
-];
+use tracing::debug;
 
 #[derive(Serialize)]
 struct SchemaInfo {
@@ -44,6 +31,8 @@ struct InfoOutput {
     beads_dir: String,
     mode: String,
     daemon_connected: bool,
+    #[serde(skip)]
+    resolved_prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_fallback_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,6 +49,14 @@ struct InfoOutput {
     jsonl_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonl_size: Option<u64>,
+}
+
+#[derive(Default)]
+struct InfoSnapshot {
+    issue_count: Option<usize>,
+    config_map: Option<HashMap<String, String>>,
+    detected_prefix: Option<String>,
+    schema: Option<SchemaInfo>,
 }
 
 /// Execute the info command.
@@ -79,51 +76,11 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         );
     }
 
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let db_path = canonicalize_lossy(&storage_ctx.paths.db_path);
+    let output = collect_info_output(args, cli)?;
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
-
-    let issue_count = Some(storage_ctx.storage.count_issues()?);
-    let config_map = Some(storage_ctx.storage.get_all_config()?).filter(|map| !map.is_empty());
-    let schema = if args.schema {
-        Some(build_schema_info(
-            &storage_ctx.storage,
-            config_map.as_ref(),
-        )?)
-    } else {
-        None
-    };
-
-    // Get additional info for rich output
-    let db_size = std::fs::metadata(&storage_ctx.paths.db_path)
-        .map(|m| m.len())
-        .ok();
-    let jsonl_size = std::fs::metadata(&storage_ctx.paths.jsonl_path)
-        .map(|m| m.len())
-        .ok();
-
-    let output = InfoOutput {
-        database_path: db_path.display().to_string(),
-        beads_dir: canonicalize_lossy(&beads_dir).display().to_string(),
-        mode: "direct".to_string(),
-        daemon_connected: false,
-        daemon_fallback_reason: Some("no-daemon".to_string()),
-        daemon_detail: Some("br runs in direct mode only".to_string()),
-        issue_count,
-        config: config_map,
-        schema,
-        db_size,
-        jsonl_path: Some(
-            canonicalize_lossy(&storage_ctx.paths.jsonl_path)
-                .display()
-                .to_string(),
-        ),
-        jsonl_size,
-    };
 
     if ctx.is_json() {
         ctx.json_pretty(&output);
@@ -144,30 +101,185 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     Ok(())
 }
 
-fn build_schema_info(
-    storage: &SqliteStorage,
-    config_map: Option<&HashMap<String, String>>,
-) -> Result<SchemaInfo> {
-    let mut ids = storage.get_all_ids()?;
-    let sample_issue_ids: Vec<String> = ids.drain(..ids.len().min(3)).collect();
+fn collect_info_output(args: &InfoArgs, cli: &config::CliOverrides) -> Result<InfoOutput> {
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let startup = config::load_startup_config_with_paths(&beads_dir, cli.db.as_ref())?;
+    let snapshot = load_info_snapshot_without_recovery(args, &startup.paths);
+    let resolved_prefix = config::configured_issue_prefix_from_map(&startup.merged_config.runtime)
+        .or_else(|| snapshot.detected_prefix.clone())
+        .or_else(|| {
+            config::first_prefix_from_jsonl(&startup.paths.jsonl_path)
+                .ok()
+                .flatten()
+        });
 
-    let mut detected_prefix = config_map
-        .and_then(|map| map.get("issue_prefix").cloned())
-        .filter(|value| !value.trim().is_empty());
+    let db_path = canonicalize_lossy(&startup.paths.db_path);
+    let db_size = std::fs::metadata(&startup.paths.db_path)
+        .map(|metadata| metadata.len())
+        .ok();
+    let jsonl_size = std::fs::metadata(&startup.paths.jsonl_path)
+        .map(|metadata| metadata.len())
+        .ok();
 
-    if detected_prefix.is_none() {
-        detected_prefix = sample_issue_ids
-            .first()
-            .and_then(|id| parse_id(id).ok().map(|parsed| parsed.prefix));
+    Ok(InfoOutput {
+        database_path: db_path.display().to_string(),
+        beads_dir: canonicalize_lossy(&beads_dir).display().to_string(),
+        mode: "direct".to_string(),
+        daemon_connected: false,
+        resolved_prefix,
+        daemon_fallback_reason: Some("no-daemon".to_string()),
+        daemon_detail: Some("br runs in direct mode only".to_string()),
+        issue_count: snapshot.issue_count,
+        config: snapshot.config_map,
+        schema: snapshot.schema,
+        db_size,
+        jsonl_path: Some(
+            canonicalize_lossy(&startup.paths.jsonl_path)
+                .display()
+                .to_string(),
+        ),
+        jsonl_size,
+    })
+}
+
+fn load_info_snapshot_without_recovery(
+    args: &InfoArgs,
+    paths: &config::ConfigPaths,
+) -> InfoSnapshot {
+    if !paths.db_path.is_file() {
+        return InfoSnapshot::default();
     }
 
-    Ok(SchemaInfo {
-        tables: SCHEMA_TABLES.iter().map(ToString::to_string).collect(),
-        schema_version: CURRENT_SCHEMA_VERSION.to_string(),
+    match config::with_database_family_snapshot(&paths.db_path, |snapshot_db_path| {
+        let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+        let issue_count = query_issue_count(&conn);
+        let config_map = load_config_map(&conn);
+        let detected_prefix = detect_prefix(&conn, config_map.as_ref());
+        let schema = if args.schema {
+            Some(build_schema_info(
+                &conn,
+                config_map.as_ref(),
+                detected_prefix.clone(),
+            ))
+        } else {
+            None
+        };
+
+        Ok(InfoSnapshot {
+            issue_count,
+            config_map,
+            detected_prefix,
+            schema,
+        })
+    }) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            debug!(
+                path = %paths.db_path.display(),
+                error = %err,
+                "Skipping DB-backed info details because the database could not be snapshotted for read-only access"
+            );
+            InfoSnapshot::default()
+        }
+    }
+}
+
+fn query_issue_count(conn: &Connection) -> Option<usize> {
+    conn.query_row("SELECT COUNT(*) FROM issues")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .and_then(|count| usize::try_from(count).ok())
+}
+
+fn load_config_map(conn: &Connection) -> Option<HashMap<String, String>> {
+    let rows = conn.query("SELECT key, value FROM config").ok()?;
+    let mut config_map = HashMap::new();
+
+    for row in rows {
+        let Some(key) = row.get(0).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let Some(value) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        config_map.insert(key.to_string(), value.to_string());
+    }
+
+    (!config_map.is_empty()).then_some(config_map)
+}
+
+fn build_schema_info(
+    conn: &Connection,
+    config_map: Option<&HashMap<String, String>>,
+    detected_prefix: Option<String>,
+) -> SchemaInfo {
+    let tables = actual_table_names(conn);
+    let sample_issue_ids: Vec<String> = conn
+        .query("SELECT id FROM issues ORDER BY id LIMIT 3")
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    SchemaInfo {
+        tables,
+        schema_version: actual_schema_version(conn),
         config: config_map.cloned(),
         sample_issue_ids,
         detected_prefix,
+    }
+}
+
+fn detect_prefix(
+    conn: &Connection,
+    config_map: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    config_map
+        .and_then(config::configured_issue_prefix_from_map)
+        .or_else(|| {
+            conn.query("SELECT id FROM issues ORDER BY id LIMIT 1")
+                .ok()
+                .and_then(|rows| rows.first().cloned())
+                .and_then(|row| {
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .map(str::to_string)
+                })
+                .and_then(|id| parse_id(&id).ok().map(|parsed| parsed.prefix))
+        })
+}
+
+fn actual_table_names(conn: &Connection) -> Vec<String> {
+    conn.query(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name",
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect()
     })
+    .unwrap_or_default()
+}
+
+fn actual_schema_version(conn: &Connection) -> String {
+    conn.query_row("PRAGMA user_version")
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
+        .map_or_else(|| "unknown".to_string(), |version| version.to_string())
 }
 
 fn print_human(info: &InfoOutput) {
@@ -198,9 +310,7 @@ fn print_human(info: &InfoOutput) {
         println!("Issue count: {count}");
     }
 
-    if let Some(config_map) = &info.config
-        && let Some(prefix) = config_map.get("issue_prefix")
-    {
+    if let Some(prefix) = info.resolved_prefix.as_deref() {
         println!("Issue prefix: {prefix}");
     }
 
@@ -253,9 +363,7 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
     content.append("\n");
 
     // Prefix (if available)
-    if let Some(config_map) = &info.config
-        && let Some(prefix) = config_map.get("issue_prefix")
-    {
+    if let Some(prefix) = info.resolved_prefix.as_deref() {
         content.append_styled("Prefix      ", theme.dimmed.clone());
         content.append_styled(prefix, theme.issue_id.clone());
         content.append("\n");
@@ -364,6 +472,35 @@ fn canonicalize_lossy(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::InfoArgs;
+    use crate::config::CliOverrides;
+    use crate::storage::SqliteStorage;
+    use crate::storage::schema::CURRENT_SCHEMA_VERSION;
+    use std::env;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+    use tempfile::TempDir;
+
+    static TEST_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().expect("current dir");
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
 
     #[test]
     fn test_format_bytes_small() {
@@ -386,5 +523,300 @@ mod tests {
     #[test]
     fn test_format_bytes_gb() {
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    #[test]
+    fn test_collect_info_output_does_not_create_missing_db() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert!(
+            !beads_dir.join("beads.db").exists(),
+            "info collection should not create a missing database"
+        );
+        assert!(output.issue_count.is_none());
+        assert_eq!(
+            output.database_path,
+            beads_dir.join("beads.db").display().to_string()
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_reads_existing_db_without_recovery() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+        let issue = crate::model::Issue {
+            id: "bd-abc12".to_string(),
+            title: "Example".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::LOW,
+            ..crate::model::Issue::default()
+        };
+        storage.create_issue(&issue, "test").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(
+            &InfoArgs {
+                schema: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+
+        assert_eq!(output.issue_count, Some(1));
+        assert_eq!(
+            output
+                .config
+                .as_ref()
+                .and_then(|config| config.get("issue_prefix"))
+                .map(String::as_str),
+            Some("bd")
+        );
+        let expected_version = CURRENT_SCHEMA_VERSION.to_string();
+        assert_eq!(
+            output
+                .schema
+                .as_ref()
+                .map(|schema| schema.schema_version.as_str()),
+            Some(expected_version.as_str())
+        );
+        let expected_tables = vec![
+            "blocked_issues_cache".to_string(),
+            "child_counters".to_string(),
+            "comments".to_string(),
+            "config".to_string(),
+            "dependencies".to_string(),
+            "dirty_issues".to_string(),
+            "events".to_string(),
+            "export_hashes".to_string(),
+            "issues".to_string(),
+            "labels".to_string(),
+            "metadata".to_string(),
+        ];
+        assert_eq!(
+            output
+                .schema
+                .as_ref()
+                .map(|schema| schema.tables.as_slice()),
+            Some(expected_tables.as_slice())
+        );
+        assert_eq!(
+            output
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.detected_prefix.as_deref()),
+            Some("bd")
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_reports_actual_schema_snapshot() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY)")
+            .unwrap();
+        conn.execute("PRAGMA user_version = 1").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(
+            &InfoArgs {
+                schema: true,
+                ..InfoArgs::default()
+            },
+            &CliOverrides::default(),
+        )
+        .unwrap();
+
+        let schema = output.schema.expect("schema details");
+        assert_eq!(schema.schema_version, "1");
+        assert_eq!(schema.tables, vec!["issues".to_string()]);
+        assert!(schema.config.is_none());
+        assert!(schema.sample_issue_ids.is_empty());
+    }
+
+    #[test]
+    fn test_collect_info_output_prefers_startup_issue_prefix_over_db_config() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        std::fs::write(beads_dir.join("config.yaml"), "issue_prefix: proj\n").unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("issue_prefix", "bd").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
+        assert_eq!(
+            output
+                .config
+                .as_ref()
+                .and_then(|config| config.get("issue_prefix"))
+                .map(String::as_str),
+            Some("bd"),
+            "serialized DB config should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_detects_prefix_without_schema_flag() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("issue_prefix", "proj").unwrap();
+        let issue = crate::model::Issue {
+            id: "proj-abc12".to_string(),
+            title: "Example".to_string(),
+            issue_type: crate::model::IssueType::Task,
+            priority: crate::model::Priority::LOW,
+            ..crate::model::Issue::default()
+        };
+        storage.create_issue(&issue, "test").unwrap();
+        storage.delete_config("issue_prefix").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
+        assert!(output.schema.is_none());
+        assert!(
+            output
+                .config
+                .as_ref()
+                .and_then(|config| config.get("issue_prefix"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_collect_info_output_uses_jsonl_prefix_when_db_is_missing() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            beads_dir.join("issues.jsonl"),
+            r#"{"id":"proj-abc12","title":"Example"}"#,
+        )
+        .unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
+        assert!(output.issue_count.is_none());
+        assert!(output.config.is_none());
+        assert!(output.schema.is_none());
+    }
+
+    #[test]
+    fn test_collect_info_output_accepts_startup_prefix_alias() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+        std::fs::write(beads_dir.join("config.yaml"), "prefix: proj\n").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn test_collect_info_output_accepts_db_prefix_alias() {
+        let _lock = TEST_DIR_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        std::fs::write(
+            beads_dir.join("metadata.json"),
+            r#"{"database":"beads.db","jsonl_export":"issues.jsonl"}"#,
+        )
+        .unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.set_config("prefix", "proj").unwrap();
+
+        let _guard = DirGuard::new(temp.path());
+
+        let output = collect_info_output(&InfoArgs::default(), &CliOverrides::default()).unwrap();
+
+        assert_eq!(output.resolved_prefix.as_deref(), Some("proj"));
+        assert_eq!(
+            output
+                .config
+                .as_ref()
+                .and_then(|config| config.get("prefix"))
+                .map(String::as_str),
+            Some("proj")
+        );
     }
 }

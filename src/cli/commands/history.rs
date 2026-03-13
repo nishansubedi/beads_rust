@@ -46,6 +46,135 @@ impl Drop for TempRestoreGuard {
     }
 }
 
+const MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS: u64 = 1024;
+
+fn create_restore_rollback_snapshot(
+    target_path: &Path,
+    beads_dir: &Path,
+) -> Result<TempRestoreGuard> {
+    let pid = u64::from(std::process::id());
+
+    for offset in 1..=MAX_RESTORE_ROLLBACK_PATH_ATTEMPTS {
+        let rollback_path =
+            target_path.with_extension(format!("jsonl.{}.tmp", pid.saturating_add(offset)));
+        validate_temp_file_path(&rollback_path, target_path, beads_dir, true)?;
+
+        let mut writer = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&rollback_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let rollback_guard = TempRestoreGuard::new(rollback_path);
+        let mut reader = File::open(target_path)?;
+        io::copy(&mut reader, &mut writer)?;
+        writer.sync_all()?;
+        drop(writer);
+        return Ok(rollback_guard);
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate rollback snapshot path for '{}'",
+        target_path.display()
+    )))
+}
+
+fn commit_restored_target_with_rollback<R>(
+    temp_path: &Path,
+    target_path: &Path,
+    rollback_guard: Option<&mut TempRestoreGuard>,
+    mut rename_impl: R,
+) -> Result<()>
+where
+    R: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    match rename_impl(temp_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if let Some(rollback_guard) = rollback_guard {
+                if !target_path.exists() {
+                    return match fs::rename(&rollback_guard.path, target_path) {
+                        Ok(()) => Err(BeadsError::Config(format!(
+                            "Failed to replace '{}' with the restored backup: {rename_err}. The original target was restored.",
+                            target_path.display()
+                        ))),
+                        Err(rollback_err) => {
+                            rollback_guard.persist();
+                            Err(BeadsError::Config(format!(
+                                "Failed to replace '{}' with the restored backup: {rename_err}. Restoring the original target from '{}' also failed: {rollback_err}",
+                                target_path.display(),
+                                rollback_guard.path.display()
+                            )))
+                        }
+                    };
+                }
+
+                rollback_guard.persist();
+                return Err(BeadsError::Config(format!(
+                    "Failed to replace '{}' with the restored backup: {rename_err}. The original target snapshot was preserved at '{}'.",
+                    target_path.display(),
+                    rollback_guard.path.display()
+                )));
+            }
+
+            Err(rename_err.into())
+        }
+    }
+}
+
+fn emit_restore_output(
+    ctx: &OutputContext,
+    backup_name: &str,
+    target_path: &Path,
+    target_name: &str,
+) {
+    if ctx.is_json() {
+        let output = json!({
+            "action": "restore",
+            "backup": backup_name,
+            "target": target_path.display().to_string(),
+            "restored": true,
+            "next_step": "br sync --import-only --force",
+        });
+        ctx.json_pretty(&output);
+        return;
+    }
+
+    if ctx.is_toon() {
+        let output = json!({
+            "action": "restore",
+            "backup": backup_name,
+            "target": target_path.display().to_string(),
+            "restored": true,
+            "next_step": "br sync --import-only --force",
+        });
+        ctx.toon(&output);
+        return;
+    }
+
+    if ctx.is_quiet() {
+        return;
+    }
+
+    if ctx.is_rich() {
+        let theme = ctx.theme();
+        let body = format!(
+            "Restored {backup_name} to {target_name}.\nNext: br sync --import-only --force"
+        );
+        let panel = Panel::from_text(&body)
+            .title(Text::styled("History Restore", theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+        ctx.render(&panel);
+    } else {
+        println!("Restored {backup_name} to {target_name}");
+        println!("Run 'br sync --import-only --force' to import this state into the database.");
+    }
+}
+
 fn ensure_regular_backup_file(backup_path: &Path, backup_name: &str) -> Result<()> {
     match fs::symlink_metadata(backup_path) {
         Ok(metadata) => {
@@ -396,6 +525,7 @@ fn restore_backup(
     io::copy(&mut reader, &mut writer)?;
     writer.sync_all()?;
     drop(writer);
+    let mut rollback_guard = None;
     if force && target_path.exists() {
         require_safe_sync_overwrite_path(
             &target_path,
@@ -403,57 +533,21 @@ fn restore_backup(
             true,
             "overwrite history restore target",
         )?;
+        rollback_guard = Some(create_restore_rollback_snapshot(&target_path, beads_dir)?);
         if let Err(err) = fs::remove_file(&target_path)
             && err.kind() != io::ErrorKind::NotFound
         {
             return Err(err.into());
         }
     }
-    fs::rename(&temp_path, &target_path)?;
+    commit_restored_target_with_rollback(
+        &temp_path,
+        &target_path,
+        rollback_guard.as_mut(),
+        |from, to| fs::rename(from, to),
+    )?;
     temp_guard.persist();
-
-    if ctx.is_json() {
-        let output = json!({
-            "action": "restore",
-            "backup": backup_name,
-            "target": target_path.display().to_string(),
-            "restored": true,
-            "next_step": "br sync --import-only --force",
-        });
-        ctx.json_pretty(&output);
-        return Ok(());
-    }
-
-    if ctx.is_toon() {
-        let output = json!({
-            "action": "restore",
-            "backup": backup_name,
-            "target": target_path.display().to_string(),
-            "restored": true,
-            "next_step": "br sync --import-only --force",
-        });
-        ctx.toon(&output);
-        return Ok(());
-    }
-
-    if ctx.is_quiet() {
-        return Ok(());
-    }
-
-    if ctx.is_rich() {
-        let theme = ctx.theme();
-        let body = format!(
-            "Restored {backup_name} to {target_name}.\nNext: br sync --import-only --force"
-        );
-        let panel = Panel::from_text(&body)
-            .title(Text::styled("History Restore", theme.panel_title.clone()))
-            .box_style(theme.box_style)
-            .border_style(theme.panel_border.clone());
-        ctx.render(&panel);
-    } else {
-        println!("Restored {backup_name} to {target_name}");
-        println!("Run 'br sync --import-only --force' to import this state into the database.");
-    }
+    emit_restore_output(ctx, &backup_name, &target_path, &target_name);
 
     Ok(())
 }
@@ -907,6 +1001,51 @@ mod tests {
             !beads_dir.join(format!("issues.jsonl.{pid}.tmp")).exists(),
             "failed restore should clean up the temporary restore file"
         );
+    }
+
+    #[test]
+    fn test_commit_restored_target_restores_original_file_when_replace_fails() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target_path = beads_dir.join("issues.jsonl");
+        let temp_path = beads_dir.join("issues.jsonl.100.tmp");
+        fs::write(&target_path, "original-state\n").unwrap();
+        fs::write(&temp_path, "restored-state\n").unwrap();
+
+        let mut rollback_guard =
+            create_restore_rollback_snapshot(&target_path, &beads_dir).unwrap();
+        fs::remove_file(&target_path).unwrap();
+
+        let err = commit_restored_target_with_rollback(
+            &temp_path,
+            &target_path,
+            Some(&mut rollback_guard),
+            |_from, _to| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "forced failure",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        match err {
+            BeadsError::Config(message) => {
+                assert!(
+                    message.contains("original target was restored"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "original-state\n"
+        );
+        assert_eq!(fs::read_to_string(&temp_path).unwrap(), "restored-state\n");
+        assert!(!rollback_guard.path.exists());
     }
 
     #[test]

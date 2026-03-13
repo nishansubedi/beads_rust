@@ -138,7 +138,7 @@ fn parse_backup_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
 }
 
 static BACKUP_FILENAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<stem>.+?)\.(?P<ts>\d{8}_\d{6}(?:_\d{6})?)(\.\d+)?$")
+    Regex::new(r"^(?P<stem>.+?)\.(?P<ts>\d{8}_\d{6}(?:_\d{1,9})?)(\.\d+)?$")
         .expect("static regex compilation must not fail")
 });
 
@@ -146,7 +146,8 @@ pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<
     let without_ext = filename.strip_suffix(".jsonl")?;
 
     // Pattern: <stem>.<timestamp>[.<collision_index>]
-    // Timestamp formats: YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_ffffff
+    // Timestamp formats: YYYYMMDD_HHMMSS or YYYYMMDD_HHMMSS_<fractional-seconds>
+    // where the fractional component can be microsecond or nanosecond precision.
     let caps = BACKUP_FILENAME_REGEX.captures(without_ext)?;
 
     let stem = caps.name("stem")?.as_str().to_string();
@@ -883,17 +884,24 @@ mod tests {
 
         File::create(history_dir.join("issues.20230101_100000_123456.1.jsonl")).unwrap();
         File::create(history_dir.join("issues.20230101_100001_654321.jsonl")).unwrap();
+        File::create(history_dir.join("issues.20230101_100002_123456789.jsonl")).unwrap();
 
         let backups = list_backups(history_dir, None).unwrap();
-        assert_eq!(backups.len(), 2);
+        assert_eq!(backups.len(), 3);
         assert!(
             backups[0]
+                .path
+                .to_string_lossy()
+                .contains("20230101_100002_123456789")
+        );
+        assert!(
+            backups[1]
                 .path
                 .to_string_lossy()
                 .contains("20230101_100001_654321")
         );
         assert!(
-            backups[1]
+            backups[2]
                 .path
                 .to_string_lossy()
                 .contains("20230101_100000_123456.1")

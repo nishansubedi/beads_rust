@@ -188,6 +188,85 @@ fn create_issue_id(create_json: &Value) -> String {
         .expect("create output should contain id")
 }
 
+fn assert_custom_path_resolution(fixture: &FixtureWorkspace, surface: &str, json: &Value) {
+    if fixture.metadata.name != "metadata_custom_paths" {
+        return;
+    }
+
+    let expected_db_path = fixture.beads_dir.join("custom.db");
+    let expected_jsonl_path = fixture.beads_dir.join("custom.jsonl");
+    let surface_name = match surface {
+        "where" => "where",
+        "info" => "info",
+        other => panic!("unsupported custom-path surface '{other}'"),
+    };
+
+    assert!(
+        json["database_path"]
+            .as_str()
+            .is_some_and(|path| path == expected_db_path.display().to_string()),
+        "{surface_name} should resolve custom database path: {json}"
+    );
+    assert!(
+        json["jsonl_path"]
+            .as_str()
+            .is_some_and(|path| path == expected_jsonl_path.display().to_string()),
+        "{surface_name} should resolve custom JSONL path: {json}"
+    );
+}
+
+fn assert_doctor_clean_surface(fixture: &FixtureWorkspace, context: &str, json: &Value) {
+    assert_eq!(
+        json["ok"],
+        Value::Bool(true),
+        "{context} should be clean: {json}"
+    );
+    if fixture.metadata.name == "db_jsonl_disagreement" {
+        let counts = doctor_check(json, "counts.db_vs_jsonl");
+        assert_eq!(
+            counts["status"].as_str(),
+            Some("warn"),
+            "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
+        );
+    }
+}
+
+fn assert_repair_applied_surface(context: &str, json: &Value) {
+    assert_eq!(
+        json["repaired"],
+        Value::Bool(true),
+        "{context} should apply repair: {json}"
+    );
+    assert_eq!(
+        json["verified"],
+        Value::Bool(true),
+        "{context} should verify the repair: {json}"
+    );
+    assert_eq!(
+        json["post_repair"]["ok"],
+        Value::Bool(true),
+        "{context} should leave the workspace healthy: {json}"
+    );
+}
+
+fn assert_status_surface(
+    context: &str,
+    json: &Value,
+    expected_jsonl_newer: bool,
+    expected_db_newer: bool,
+) {
+    assert_eq!(
+        json["jsonl_newer"],
+        Value::Bool(expected_jsonl_newer),
+        "{context} reported unexpected jsonl_newer: {json}"
+    );
+    assert_eq!(
+        json["db_newer"],
+        Value::Bool(expected_db_newer),
+        "{context} reported unexpected db_newer: {json}"
+    );
+}
+
 fn assert_surface_outcome(
     fixture: &FixtureWorkspace,
     surface: &str,
@@ -200,37 +279,8 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::Success => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
-            if fixture.metadata.name == "metadata_custom_paths" && surface == "where" {
-                let expected_db_path = fixture.beads_dir.join("custom.db");
-                let expected_jsonl_path = fixture.beads_dir.join("custom.jsonl");
-                assert!(
-                    json["database_path"]
-                        .as_str()
-                        .is_some_and(|path| path == expected_db_path.display().to_string()),
-                    "where should resolve custom database path: {json}"
-                );
-                assert!(
-                    json["jsonl_path"]
-                        .as_str()
-                        .is_some_and(|path| path == expected_jsonl_path.display().to_string()),
-                    "where should resolve custom JSONL path: {json}"
-                );
-            }
-            if fixture.metadata.name == "metadata_custom_paths" && surface == "info" {
-                let expected_db_path = fixture.beads_dir.join("custom.db");
-                let expected_jsonl_path = fixture.beads_dir.join("custom.jsonl");
-                assert!(
-                    json["database_path"]
-                        .as_str()
-                        .is_some_and(|path| path == expected_db_path.display().to_string()),
-                    "info should resolve custom database path: {json}"
-                );
-                assert!(
-                    json["jsonl_path"]
-                        .as_str()
-                        .is_some_and(|path| path == expected_jsonl_path.display().to_string()),
-                    "info should resolve custom JSONL path: {json}"
-                );
+            if matches!(surface, "where" | "info") {
+                assert_custom_path_resolution(fixture, surface, &json);
             }
         }
         WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery => {
@@ -241,19 +291,7 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::DoctorClean => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
-            assert_eq!(
-                json["ok"],
-                Value::Bool(true),
-                "{context} should be clean: {json}"
-            );
-            if fixture.metadata.name == "db_jsonl_disagreement" {
-                let counts = doctor_check(&json, "counts.db_vs_jsonl");
-                assert_eq!(
-                    counts["status"].as_str(),
-                    Some("warn"),
-                    "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
-                );
-            }
+            assert_doctor_clean_surface(fixture, &context, &json);
         }
         WorkspaceFailureCommandOutcome::ReportsErrors => {
             assert!(
@@ -272,21 +310,7 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::RepairApplied => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
-            assert_eq!(
-                json["repaired"],
-                Value::Bool(true),
-                "{context} should apply repair: {json}"
-            );
-            assert_eq!(
-                json["verified"],
-                Value::Bool(true),
-                "{context} should verify the repair: {json}"
-            );
-            assert_eq!(
-                json["post_repair"]["ok"],
-                Value::Bool(true),
-                "{context} should leave the workspace healthy: {json}"
-            );
+            assert_repair_applied_surface(&context, &json);
         }
         WorkspaceFailureCommandOutcome::RepairNoop => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
@@ -300,30 +324,12 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::StatusInSync => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
-            assert_eq!(
-                json["jsonl_newer"],
-                Value::Bool(false),
-                "{context} should not report newer JSONL: {json}"
-            );
-            assert_eq!(
-                json["db_newer"],
-                Value::Bool(false),
-                "{context} should not report newer DB state: {json}"
-            );
+            assert_status_surface(&context, &json, false, false);
         }
         WorkspaceFailureCommandOutcome::StatusJsonlNewer => {
             assert!(run.status.success(), "{context} failed: {}", run.stderr);
             let json = parse_stdout_json(&run, &context);
-            assert_eq!(
-                json["jsonl_newer"],
-                Value::Bool(true),
-                "{context} should report newer JSONL: {json}"
-            );
-            assert_eq!(
-                json["db_newer"],
-                Value::Bool(false),
-                "{context} should not report newer DB state: {json}"
-            );
+            assert_status_surface(&context, &json, true, false);
         }
         WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
             assert_config_error(&run, "Prefix mismatch", &context);
@@ -334,6 +340,254 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::FailsInvalidJson => {
             assert_config_error(&run, "Invalid JSON", &context);
         }
+    }
+}
+
+fn assert_core_read_success(fixture: &FixtureWorkspace) {
+    let list_workspace = fixture_workspace(&fixture.metadata.name);
+    let list = run_br(
+        &list_workspace.workspace,
+        ["list", "--json"],
+        &surface_label(&fixture.metadata.name, "core_list"),
+    );
+    assert!(
+        list.status.success(),
+        "{} list --json failed: {}",
+        fixture.metadata.name,
+        list.stderr
+    );
+    let list_json = parse_stdout_json(&list, &format!("{} core list", fixture.metadata.name));
+    let issue_id = first_issue_id(&list_json);
+
+    let ready_workspace = fixture_workspace(&fixture.metadata.name);
+    let ready = run_br(
+        &ready_workspace.workspace,
+        ["ready", "--json"],
+        &surface_label(&fixture.metadata.name, "core_ready"),
+    );
+    assert!(
+        ready.status.success(),
+        "{} ready --json failed: {}",
+        fixture.metadata.name,
+        ready.stderr
+    );
+    let _ready_json = parse_stdout_json(&ready, &format!("{} core ready", fixture.metadata.name));
+
+    let show_workspace = fixture_workspace(&fixture.metadata.name);
+    let show = run_br(
+        &show_workspace.workspace,
+        ["show", &issue_id, "--json"],
+        &surface_label(&fixture.metadata.name, "core_show"),
+    );
+    assert!(
+        show.status.success(),
+        "{} show --json failed: {}",
+        fixture.metadata.name,
+        show.stderr
+    );
+    let _show_json = parse_stdout_json(&show, &format!("{} core show", fixture.metadata.name));
+
+    if fixture
+        .metadata
+        .outcome_for("startup/open")
+        .is_some_and(|outcome| outcome == WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery)
+    {
+        assert_sqlite_header(
+            &resolved_database_path(&show_workspace, "core_resolved_db"),
+            &format!("{} core show", fixture.metadata.name),
+        );
+    }
+}
+
+fn assert_core_read_failure(
+    fixture: &FixtureWorkspace,
+    where_json: &Value,
+    failure: WorkspaceFailureCommandOutcome,
+) {
+    let list_workspace = fixture_workspace(&fixture.metadata.name);
+    assert_surface_outcome(&list_workspace, "startup/open", failure);
+
+    let ready_workspace = fixture_workspace(&fixture.metadata.name);
+    let ready = run_br(
+        &ready_workspace.workspace,
+        ["ready", "--json"],
+        &surface_label(&fixture.metadata.name, "core_ready_fail"),
+    );
+    match failure {
+        WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
+            assert_config_error(
+                &ready,
+                "Prefix mismatch",
+                &format!("{} core ready", fixture.metadata.name),
+            );
+        }
+        WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            assert_config_error(
+                &ready,
+                "Merge conflict markers detected",
+                &format!("{} core ready", fixture.metadata.name),
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    let jsonl_path = where_json["jsonl_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .expect("where jsonl_path");
+    let issue_id = first_issue_id_from_jsonl(&jsonl_path);
+    let show_workspace = fixture_workspace(&fixture.metadata.name);
+    let show = run_br(
+        &show_workspace.workspace,
+        ["show", &issue_id, "--json"],
+        &surface_label(&fixture.metadata.name, "core_show_fail"),
+    );
+    match failure {
+        WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
+            assert_config_error(
+                &show,
+                "Prefix mismatch",
+                &format!("{} core show", fixture.metadata.name),
+            );
+        }
+        WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            assert_config_error(
+                &show,
+                "Merge conflict markers detected",
+                &format!("{} core show", fixture.metadata.name),
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn assert_core_write_success(
+    fixture: &FixtureWorkspace,
+    create: &BrRun,
+    expected_create: WorkspaceFailureCommandOutcome,
+) {
+    let create_json = parse_stdout_json(create, &format!("{} core create", fixture.metadata.name));
+    let issue_id = create_issue_id(&create_json);
+    if expected_create == WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery {
+        assert_sqlite_header(
+            &resolved_database_path(fixture, "core_create_resolved_db"),
+            &format!("{} core create", fixture.metadata.name),
+        );
+    }
+
+    let show = run_br(
+        &fixture.workspace,
+        ["show", &issue_id, "--json"],
+        &surface_label(&fixture.metadata.name, "core_show_created"),
+    );
+    assert!(
+        show.status.success(),
+        "{} show after create failed: {}",
+        fixture.metadata.name,
+        show.stderr
+    );
+    let _show_json = parse_stdout_json(
+        &show,
+        &format!("{} core show after create", fixture.metadata.name),
+    );
+
+    let update = run_br(
+        &fixture.workspace,
+        ["update", &issue_id, "--status", "in_progress", "--json"],
+        &surface_label(&fixture.metadata.name, "core_update"),
+    );
+    assert!(
+        update.status.success(),
+        "{} update failed: {}",
+        fixture.metadata.name,
+        update.stderr
+    );
+
+    let label_add = run_br(
+        &fixture.workspace,
+        ["label", "add", &issue_id, "replay-probe", "--json"],
+        &surface_label(&fixture.metadata.name, "core_label"),
+    );
+    assert!(
+        label_add.status.success(),
+        "{} label add failed: {}",
+        fixture.metadata.name,
+        label_add.stderr
+    );
+
+    let comment = run_br(
+        &fixture.workspace,
+        ["comments", "add", &issue_id, "Replay note", "--json"],
+        &surface_label(&fixture.metadata.name, "core_comment"),
+    );
+    assert!(
+        comment.status.success(),
+        "{} comments add failed: {}",
+        fixture.metadata.name,
+        comment.stderr
+    );
+
+    let close = run_br(
+        &fixture.workspace,
+        ["close", &issue_id, "--reason", "Replay close", "--json"],
+        &surface_label(&fixture.metadata.name, "core_close"),
+    );
+    assert!(
+        close.status.success(),
+        "{} close failed: {}",
+        fixture.metadata.name,
+        close.stderr
+    );
+
+    let reopen = run_br(
+        &fixture.workspace,
+        ["reopen", &issue_id, "--json"],
+        &surface_label(&fixture.metadata.name, "core_reopen"),
+    );
+    assert!(
+        reopen.status.success(),
+        "{} reopen failed: {}",
+        fixture.metadata.name,
+        reopen.stderr
+    );
+
+    let delete = run_br(
+        &fixture.workspace,
+        ["delete", &issue_id, "--json"],
+        &surface_label(&fixture.metadata.name, "core_delete"),
+    );
+    assert!(
+        delete.status.success(),
+        "{} delete failed: {}",
+        fixture.metadata.name,
+        delete.stderr
+    );
+}
+
+fn assert_core_write_failure(
+    fixture: &FixtureWorkspace,
+    create: &BrRun,
+    expected_create: WorkspaceFailureCommandOutcome,
+) {
+    match expected_create {
+        WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
+            assert_config_error(
+                create,
+                "Prefix mismatch",
+                &format!("{} core create", fixture.metadata.name),
+            );
+        }
+        WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            assert_config_error(
+                create,
+                "Merge conflict markers detected",
+                &format!("{} core create", fixture.metadata.name),
+            );
+        }
+        other => panic!(
+            "{} has unsupported create outcome for core write replay: {:?}",
+            fixture.metadata.name, other
+        ),
     }
 }
 
@@ -394,63 +648,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
         {
             WorkspaceFailureCommandOutcome::Success
             | WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery => {
-                let list_workspace = fixture_workspace(&fixture.metadata.name);
-                let list = run_br(
-                    &list_workspace.workspace,
-                    ["list", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_list"),
-                );
-                assert!(
-                    list.status.success(),
-                    "{} list --json failed: {}",
-                    fixture.metadata.name,
-                    list.stderr
-                );
-                let list_json =
-                    parse_stdout_json(&list, &format!("{} core list", fixture.metadata.name));
-                let issue_id = first_issue_id(&list_json);
-
-                let ready_workspace = fixture_workspace(&fixture.metadata.name);
-                let ready = run_br(
-                    &ready_workspace.workspace,
-                    ["ready", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_ready"),
-                );
-                assert!(
-                    ready.status.success(),
-                    "{} ready --json failed: {}",
-                    fixture.metadata.name,
-                    ready.stderr
-                );
-                let _ready_json =
-                    parse_stdout_json(&ready, &format!("{} core ready", fixture.metadata.name));
-
-                let show_workspace = fixture_workspace(&fixture.metadata.name);
-                let show = run_br(
-                    &show_workspace.workspace,
-                    ["show", &issue_id, "--json"],
-                    &surface_label(&fixture.metadata.name, "core_show"),
-                );
-                assert!(
-                    show.status.success(),
-                    "{} show --json failed: {}",
-                    fixture.metadata.name,
-                    show.stderr
-                );
-                let _show_json =
-                    parse_stdout_json(&show, &format!("{} core show", fixture.metadata.name));
-                if fixture
-                    .metadata
-                    .outcome_for("startup/open")
-                    .is_some_and(|outcome| {
-                        outcome == WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery
-                    })
-                {
-                    assert_sqlite_header(
-                        &resolved_database_path(&show_workspace, "core_resolved_db"),
-                        &format!("{} core show", fixture.metadata.name),
-                    );
-                }
+                assert_core_read_success(&where_workspace);
             }
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
             | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
@@ -458,61 +656,7 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
                     .metadata
                     .outcome_for("startup/open")
                     .expect("startup/open failure");
-                let list_workspace = fixture_workspace(&fixture.metadata.name);
-                assert_surface_outcome(&list_workspace, "startup/open", failure);
-
-                let ready_workspace = fixture_workspace(&fixture.metadata.name);
-                let ready = run_br(
-                    &ready_workspace.workspace,
-                    ["ready", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_ready_fail"),
-                );
-                match failure {
-                    WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
-                        assert_config_error(
-                            &ready,
-                            "Prefix mismatch",
-                            &format!("{} core ready", fixture.metadata.name),
-                        );
-                    }
-                    WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-                        assert_config_error(
-                            &ready,
-                            "Merge conflict markers detected",
-                            &format!("{} core ready", fixture.metadata.name),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-
-                let jsonl_path = where_json["jsonl_path"]
-                    .as_str()
-                    .map(PathBuf::from)
-                    .expect("where jsonl_path");
-                let issue_id = first_issue_id_from_jsonl(&jsonl_path);
-                let show_workspace = fixture_workspace(&fixture.metadata.name);
-                let show = run_br(
-                    &show_workspace.workspace,
-                    ["show", &issue_id, "--json"],
-                    &surface_label(&fixture.metadata.name, "core_show_fail"),
-                );
-                match failure {
-                    WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
-                        assert_config_error(
-                            &show,
-                            "Prefix mismatch",
-                            &format!("{} core show", fixture.metadata.name),
-                        );
-                    }
-                    WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-                        assert_config_error(
-                            &show,
-                            "Merge conflict markers detected",
-                            &format!("{} core show", fixture.metadata.name),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
+                assert_core_read_failure(&where_workspace, &where_json, failure);
             }
             other => panic!(
                 "{} has unsupported startup/open outcome for core read replay: {:?}",
@@ -549,117 +693,11 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
                     fixture.metadata.name,
                     create.stderr
                 );
-                let create_json =
-                    parse_stdout_json(&create, &format!("{} core create", fixture.metadata.name));
-                let issue_id = create_issue_id(&create_json);
-                if expected_create == WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery {
-                    assert_sqlite_header(
-                        &resolved_database_path(&workspace, "core_create_resolved_db"),
-                        &format!("{} core create", fixture.metadata.name),
-                    );
-                }
-
-                let show = run_br(
-                    &workspace.workspace,
-                    ["show", &issue_id, "--json"],
-                    &surface_label(&fixture.metadata.name, "core_show_created"),
-                );
-                assert!(
-                    show.status.success(),
-                    "{} show after create failed: {}",
-                    fixture.metadata.name,
-                    show.stderr
-                );
-                let _show_json = parse_stdout_json(
-                    &show,
-                    &format!("{} core show after create", fixture.metadata.name),
-                );
-
-                let update = run_br(
-                    &workspace.workspace,
-                    ["update", &issue_id, "--status", "in_progress", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_update"),
-                );
-                assert!(
-                    update.status.success(),
-                    "{} update failed: {}",
-                    fixture.metadata.name,
-                    update.stderr
-                );
-
-                let label_add = run_br(
-                    &workspace.workspace,
-                    ["label", "add", &issue_id, "replay-probe", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_label"),
-                );
-                assert!(
-                    label_add.status.success(),
-                    "{} label add failed: {}",
-                    fixture.metadata.name,
-                    label_add.stderr
-                );
-
-                let comment = run_br(
-                    &workspace.workspace,
-                    ["comments", "add", &issue_id, "Replay note", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_comment"),
-                );
-                assert!(
-                    comment.status.success(),
-                    "{} comments add failed: {}",
-                    fixture.metadata.name,
-                    comment.stderr
-                );
-
-                let close = run_br(
-                    &workspace.workspace,
-                    ["close", &issue_id, "--reason", "Replay close", "--json"],
-                    &surface_label(&fixture.metadata.name, "core_close"),
-                );
-                assert!(
-                    close.status.success(),
-                    "{} close failed: {}",
-                    fixture.metadata.name,
-                    close.stderr
-                );
-
-                let reopen = run_br(
-                    &workspace.workspace,
-                    ["reopen", &issue_id, "--json"],
-                    &surface_label(&fixture.metadata.name, "core_reopen"),
-                );
-                assert!(
-                    reopen.status.success(),
-                    "{} reopen failed: {}",
-                    fixture.metadata.name,
-                    reopen.stderr
-                );
-
-                let delete = run_br(
-                    &workspace.workspace,
-                    ["delete", &issue_id, "--json"],
-                    &surface_label(&fixture.metadata.name, "core_delete"),
-                );
-                assert!(
-                    delete.status.success(),
-                    "{} delete failed: {}",
-                    fixture.metadata.name,
-                    delete.stderr
-                );
+                assert_core_write_success(&workspace, &create, expected_create);
             }
-            WorkspaceFailureCommandOutcome::FailsPrefixMismatch => {
-                assert_config_error(
-                    &create,
-                    "Prefix mismatch",
-                    &format!("{} core create", fixture.metadata.name),
-                );
-            }
-            WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-                assert_config_error(
-                    &create,
-                    "Merge conflict markers detected",
-                    &format!("{} core create", fixture.metadata.name),
-                );
+            WorkspaceFailureCommandOutcome::FailsPrefixMismatch
+            | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+                assert_core_write_failure(&workspace, &create, expected_create);
             }
             other => panic!(
                 "{} has unsupported create outcome for core write replay: {:?}",
