@@ -36,7 +36,7 @@ use tracing::warn;
 /// Accepts `.beads` (default) and `_beads` (for monorepos that
 /// disallow dot-directories).
 pub fn is_beads_dir_name(name: &std::ffi::OsStr) -> bool {
-    name == ".beads" || name == "_beads"
+    name == ".beads" || name == "_beads" || name == ".muninn"
 }
 
 /// Default database filename used when metadata is missing.
