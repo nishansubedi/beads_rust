@@ -111,3 +111,7 @@ storage.sqlite3-wal.corrupt-*
 
 # Malformed workspace test directories (br test artifacts)
 br_malformed_*/
+
+# SQLite WAL/SHM files in sample databases
+sample_beads_db_files/**/*.db-shm
+sample_beads_db_files/**/*.db-wal
