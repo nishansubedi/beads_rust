@@ -205,8 +205,8 @@ mod tests {
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
-    use fsqlite::Connection;
-    use fsqlite_error::FrankenError;
+    use crate::storage::compat::Connection;
+    use crate::storage::compat::CompatError as FrankenError;
     use std::fs;
     use tempfile::TempDir;
 

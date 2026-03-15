@@ -41,7 +41,7 @@ pub enum BeadsError {
 
     /// `SQLite` database error.
     #[error("Database error: {0}")]
-    Database(#[from] fsqlite_error::FrankenError),
+    Database(#[from] crate::storage::compat::CompatError),
 
     // === Issue Errors ===
     /// Issue with the specified ID was not found.
@@ -328,7 +328,7 @@ mod tests {
         assert!(recoverable.is_user_recoverable());
 
         let not_recoverable =
-            BeadsError::Database(fsqlite_error::FrankenError::Internal("test".to_string()));
+            BeadsError::Database(crate::storage::compat::CompatError::Internal("test".to_string()));
         assert!(!not_recoverable.is_user_recoverable());
     }
 

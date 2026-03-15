@@ -11,9 +11,9 @@ use crate::sync::{
     PathValidation, compute_staleness, scan_conflict_markers, validate_no_git_path,
     validate_sync_path, validate_sync_path_with_external,
 };
-use fsqlite::Connection;
-use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::Connection;
+use crate::storage::compat::CompatError as FrankenError;
+use crate::storage::compat::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -2085,7 +2085,7 @@ mod tests {
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use fsqlite::Connection;
+    use crate::storage::compat::Connection;
     use std::fs;
     use tempfile::{NamedTempFile, TempDir};
 

@@ -17,8 +17,8 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::Connection;
+use crate::storage::compat::SqliteValue;
 use rich_rust::prelude::*;
 use serde_json::json;
 use shell_words::split as split_shell_words;

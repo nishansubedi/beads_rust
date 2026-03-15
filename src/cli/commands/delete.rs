@@ -741,11 +741,11 @@ mod tests {
             .mutate("test_add_deps", "tester", |tx, _ctx| {
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("bd-a"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-c"), crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 Ok(())
             })
@@ -777,11 +777,11 @@ mod tests {
             .mutate("test_add_direct_deps", "tester", |tx, _ctx| {
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("bd-a"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-c"), crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 Ok(())
             })
@@ -810,11 +810,11 @@ mod tests {
             .mutate("test_add_transitive_deps", "tester", |tx, _ctx| {
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("bd-a"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("bd-a"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 tx.execute_with_params(
                     "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES (?, ?, ?, ?)",
-                    &[fsqlite_types::SqliteValue::from("bd-c"), fsqlite_types::SqliteValue::from("bd-b"), fsqlite_types::SqliteValue::from("blocks"), fsqlite_types::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
+                    &[crate::storage::compat::SqliteValue::from("bd-c"), crate::storage::compat::SqliteValue::from("bd-b"), crate::storage::compat::SqliteValue::from("blocks"), crate::storage::compat::SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str())],
                 )?;
                 Ok(())
             })

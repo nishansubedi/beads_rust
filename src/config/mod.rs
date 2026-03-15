@@ -20,7 +20,7 @@ use crate::sync::{
 };
 use crate::util::id::IdConfig;
 use chrono::Utc;
-use fsqlite_error::FrankenError;
+use crate::storage::compat::CompatError as FrankenError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -4152,11 +4152,11 @@ routing:
         let _ = fs::remove_file(&journal_path);
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
-            let conn = fsqlite::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let conn = crate::storage::compat::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
             let row = conn.query_row("SELECT value FROM config WHERE key = 'issue_prefix'")?;
             Ok(row
                 .get(0)
-                .and_then(fsqlite_types::SqliteValue::as_text)
+                .and_then(crate::storage::compat::SqliteValue::as_text)
                 .map(str::to_string))
         })
         .expect("read snapshot");

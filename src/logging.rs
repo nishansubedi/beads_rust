@@ -80,7 +80,7 @@ fn default_filter(verbosity: u8, quiet: bool) -> String {
             }
         }
         1 => "beads_rust=debug".to_string(),
-        2 => "beads_rust=debug,fsqlite=debug".to_string(),
+        2 => "beads_rust=debug,rusqlite=debug".to_string(),
         _ => "beads_rust=trace".to_string(),
     }
 }
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn default_filter_varies_with_verbosity() {
         assert_eq!(default_filter(1, false), "beads_rust=debug");
-        assert_eq!(default_filter(2, false), "beads_rust=debug,fsqlite=debug");
+        assert_eq!(default_filter(2, false), "beads_rust=debug,rusqlite=debug");
         assert_eq!(default_filter(3, false), "beads_rust=trace");
     }
 

@@ -44,23 +44,8 @@ path = "src/main.rs"
 clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
-# Database (pure-Rust SQLite with concurrent writer support)
-# NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.0"
-fsqlite-types = "0.1.0"
-fsqlite-error = "0.1.0"
-fsqlite-core = "0.1.0"
-fsqlite-func = "0.1.0"
-fsqlite-vdbe = "0.1.0"
-fsqlite-vfs = "0.1.0"
-fsqlite-pager = "0.1.0"
-fsqlite-parser = "0.1.0"
-fsqlite-planner = "0.1.0"
-fsqlite-wal = "0.1.0"
-fsqlite-btree = "0.1.0"
-fsqlite-ast = "0.1.0"
-fsqlite-mvcc = "0.1.0"
-fsqlite-observability = "0.1.0"
+# Database (rusqlite with bundled SQLite)
+rusqlite = { version = "0.34", features = ["bundled"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -150,31 +135,7 @@ self_update = [
     "self_update/compression-zip-deflate",
 ]
 
-# Override crates.io fsqlite with the frankensqlite Git HEAD so standalone
-# builds and `cargo install` work without requiring a local sibling checkout.
-# For local development with a sibling checkout, cargo will prefer path deps
-# if ../frankensqlite exists (add path overrides to .cargo/config.toml).
 [patch.crates-io]
-fsqlite              = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite" }
-fsqlite-ast          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ast" }
-fsqlite-btree        = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-btree" }
-fsqlite-core         = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-core" }
-fsqlite-error        = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-error" }
-fsqlite-ext-fts5     = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-fts5" }
-fsqlite-ext-json     = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-json" }
-fsqlite-ext-rtree    = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-rtree" }
-fsqlite-func         = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-func" }
-fsqlite-mvcc         = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-mvcc" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-observability" }
-fsqlite-pager        = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-pager" }
-fsqlite-parser       = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-parser" }
-fsqlite-planner      = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-planner" }
-fsqlite-types        = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-types" }
-fsqlite-vdbe         = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-vdbe" }
-fsqlite-vfs          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-vfs" }
-fsqlite-wal          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-wal" }
-fsqlite-ext-icu      = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-icu" }
-fsqlite-ext-misc     = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-misc" }
 fastmcp-rust         = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
 
 [lints.rust]

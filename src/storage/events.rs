@@ -8,8 +8,8 @@
 //! Events are local DB only - never exported to JSONL.
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use fsqlite::{Connection, Row};
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::{Connection, Row};
+use crate::storage::compat::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 use crate::model::{Event, EventType};
@@ -522,7 +522,7 @@ pub fn init_events_table(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::storage::schema::execute_batch;
-    use fsqlite::Connection;
+    use crate::storage::compat::Connection;
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open(":memory:").expect("Failed to create in-memory database");

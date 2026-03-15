@@ -3,8 +3,8 @@
 use clap::builder::StyledStr;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::Connection;
+use crate::storage::compat::SqliteValue;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;

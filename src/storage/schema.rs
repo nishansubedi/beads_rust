@@ -1,7 +1,7 @@
 //! Database schema definitions and migration logic.
 
-use fsqlite::Connection;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::Connection;
+use crate::storage::compat::SqliteValue;
 
 use crate::error::{BeadsError, Result};
 
@@ -1120,7 +1120,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use crate::error::BeadsError;
-    use fsqlite::Connection;
+    use crate::storage::compat::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
 

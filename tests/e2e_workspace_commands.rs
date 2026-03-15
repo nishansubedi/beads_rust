@@ -6,7 +6,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
-use fsqlite::Connection;
+use beads_rust::storage::compat::Connection;
 use serde_json::Value;
 use std::fs;
 

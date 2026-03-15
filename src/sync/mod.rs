@@ -24,7 +24,7 @@ use crate::util::id::parse_id;
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
 use chrono::Utc;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
@@ -3755,7 +3755,7 @@ mod tests {
     use super::*;
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use chrono::Utc;
-    use fsqlite_types::SqliteValue;
+    use crate::storage::compat::SqliteValue;
     use indicatif::{ProgressBar, ProgressStyle};
     use std::collections::HashMap;
     use std::io::{self, Write};

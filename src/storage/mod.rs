@@ -12,6 +12,7 @@
 //! - [`schema`] - Database schema definitions
 //! - [`sqlite`] - Main `SQLite` storage implementation
 
+pub mod compat;
 pub mod events;
 pub mod schema;
 pub mod sqlite;

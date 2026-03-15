@@ -8,7 +8,7 @@ use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
-use fsqlite_types::value::SqliteValue;
+use crate::storage::compat::value::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 

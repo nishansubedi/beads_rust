@@ -10,9 +10,9 @@ use crate::storage::schema::{
 };
 use crate::util::id::parse_id;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use fsqlite::Connection;
-use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
+use crate::storage::compat::{Connection, Row};
+use crate::storage::compat::CompatError as FrankenError;
+use crate::storage::compat::SqliteValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Read;
@@ -215,7 +215,7 @@ impl SqliteStorage {
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(false),
             Err(error) => Err(error.into()),
         }
     }
@@ -1580,7 +1580,7 @@ impl SqliteStorage {
 
         match conn.query_row_with_params(sql, &[SqliteValue::from(id)]) {
             Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -4191,7 +4191,7 @@ impl SqliteStorage {
             &[SqliteValue::from(issue_id)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -4353,7 +4353,7 @@ impl SqliteStorage {
                     return Ok(u32::try_from(last_child).unwrap_or(0).saturating_add(1));
                 }
             }
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => {}
+            Err(FrankenError::QueryReturnedNoRows) => {}
             Err(e) => return Err(e.into()),
         }
 
@@ -4403,7 +4403,7 @@ impl SqliteStorage {
             &[SqliteValue::from(parent_id)],
         ) {
             Ok(row) => row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => 0,
+            Err(FrankenError::QueryReturnedNoRows) => 0,
             Err(e) => return Err(e.into()),
         };
 
@@ -4597,7 +4597,7 @@ impl SqliteStorage {
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
@@ -4914,7 +4914,7 @@ impl SqliteStorage {
                     .to_string();
                 Ok(Some((hash, exported)))
             }
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(BeadsError::Database(e)),
         }
     }
@@ -5026,7 +5026,7 @@ impl SqliteStorage {
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text).map(String::from)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(BeadsError::Database(e)),
         }
     }
@@ -5120,7 +5120,7 @@ impl SqliteStorage {
         }))
     }
 
-    fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -5137,7 +5137,7 @@ impl SqliteStorage {
         let get_non_empty_str = |idx: usize| -> Option<String> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
-                .filter(|s| !s.is_empty())
+                .filter(|s: &&str| !s.is_empty())
                 .map(str::to_string)
         };
         #[allow(clippy::cast_possible_truncation)]
@@ -5152,7 +5152,7 @@ impl SqliteStorage {
         let get_opt_datetime = |idx: usize| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
-                .filter(|s| !s.is_empty())
+                .filter(|s: &&str| !s.is_empty())
                 .map(parse_datetime)
                 .transpose()
         };
@@ -5444,7 +5444,7 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
 }
 
 fn dependency_metadata_from_row(
-    row: &fsqlite::Row,
+    row: &Row,
     row_role: &str,
     allow_external_placeholder: bool,
 ) -> Result<IssueWithDependencyMetadata> {
@@ -5464,7 +5464,7 @@ fn dependency_metadata_from_row(
     let status = row.get(2).and_then(SqliteValue::as_text);
     let priority = row.get(3).and_then(SqliteValue::as_integer);
 
-    let (title, status, priority) = match (title, status, priority) {
+    let (title, status, priority): (&str, &str, i64) = match (title, status, priority) {
         (Some(title), Some(status), Some(priority)) => (title, status, priority),
         _ if allow_external_placeholder && id.starts_with("external:") => {
             return Ok(IssueWithDependencyMetadata {
@@ -6040,7 +6040,7 @@ impl SqliteStorage {
             &[SqliteValue::from(external_ref)],
         ) {
             Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(BeadsError::Database(e)),
         }
     }
@@ -6063,7 +6063,7 @@ impl SqliteStorage {
             &[SqliteValue::from(content_hash)],
         ) {
             Ok(row) => Ok(Some(Self::issue_from_row(&row)?)),
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(BeadsError::Database(e)),
         }
     }
@@ -6082,7 +6082,7 @@ impl SqliteStorage {
                 let status = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
                 Ok(status == "tombstone")
             }
-            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(false),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(false),
             Err(e) => Err(BeadsError::Database(e)),
         }
     }
@@ -6413,7 +6413,7 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     comment_from_row(&row)
 }
 
-fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
+fn comment_from_row(row: &Row) -> Result<Comment> {
     let id = row
         .get(0)
         .and_then(SqliteValue::as_integer)
@@ -8532,9 +8532,9 @@ mod tests {
 
     #[test]
     fn test_diag_data_visibility() {
-        use fsqlite_types::value::SqliteValue;
+        use crate::storage::compat::value::SqliteValue;
         // Simplest possible reproduction
-        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn = Connection::open(":memory:".to_string()).unwrap();
         conn.execute("CREATE TABLE t (k TEXT, v TEXT)").unwrap();
         conn.execute_with_params(
             "INSERT INTO t VALUES (?, ?)",
@@ -8548,7 +8548,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 1. count(*) no WHERE: {:?}",
-            r1.first().map(fsqlite::Row::values)
+            r1.first().map(Row::values)
         );
 
         // 2: count with literal WHERE
@@ -8557,7 +8557,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 2. count(*) literal WHERE: {:?}",
-            r2.first().map(fsqlite::Row::values)
+            r2.first().map(Row::values)
         );
 
         // 3: count with bind WHERE
@@ -8578,7 +8578,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 3. count(*) bind WHERE: {:?}",
-            r3.first().map(fsqlite::Row::values)
+            r3.first().map(Row::values)
         );
 
         // Also get EXPLAIN for the working non-aggregate version
@@ -8598,7 +8598,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 4. select k bind WHERE: {:?}",
-            r4.first().map(fsqlite::Row::values)
+            r4.first().map(Row::values)
         );
 
         // 5: count(k) with bind WHERE
@@ -8610,7 +8610,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 5. count(k) bind WHERE: {:?}",
-            r5.first().map(fsqlite::Row::values)
+            r5.first().map(Row::values)
         );
 
         // 6: count with bind WHERE but no match
@@ -8622,7 +8622,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 6. count(*) bind WHERE no match: {:?}",
-            r6.first().map(fsqlite::Row::values)
+            r6.first().map(Row::values)
         );
 
         let c = r3
@@ -8636,9 +8636,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_diag_root_page_visibility() {
-        use fsqlite_types::value::SqliteValue;
+        use crate::storage::compat::value::SqliteValue;
         // Create full beads schema and check which root pages are accessible
-        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn = Connection::open(":memory:".to_string()).unwrap();
 
         // Apply schema step by step, checking after each table
         let tables = vec![(
@@ -8780,7 +8780,7 @@ mod tests {
 
         // Also try: incrementally create indexes and check count(*) after each
         eprintln!("[ROOT-DIAG] --- Incremental index creation with count check ---");
-        let conn2 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn2 = Connection::open(":memory:".to_string()).unwrap();
         conn2
             .execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT)")
             .unwrap();
@@ -8812,7 +8812,7 @@ mod tests {
 
         // Test multi-insert with explicit transactions
         eprintln!("[ROOT-DIAG] --- Multi-insert test ---");
-        let conn3 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn3 = Connection::open(":memory:".to_string()).unwrap();
         conn3
             .execute("CREATE TABLE ev (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -8854,7 +8854,7 @@ mod tests {
         }
 
         // Also test without explicit transactions (autocommit)
-        let conn4 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn4 = Connection::open(":memory:".to_string()).unwrap();
         conn4
             .execute("CREATE TABLE ev2 (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -8895,7 +8895,7 @@ mod tests {
 
         // Test events-like table with indexes and WHERE+ORDER BY
         eprintln!("[ROOT-DIAG] --- Events-like test ---");
-        let conn5 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn5 = Connection::open(":memory:".to_string()).unwrap();
         conn5
             .execute("CREATE TABLE issues2 (id TEXT PRIMARY KEY, title TEXT)")
             .unwrap();
