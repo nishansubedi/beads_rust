@@ -45,7 +45,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
 # Database (rusqlite with bundled SQLite)
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled", "modern_sqlite"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
