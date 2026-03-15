@@ -173,7 +173,9 @@ fsqlite-types        = { git = "https://github.com/Dicklesworthstone/frankensqli
 fsqlite-vdbe         = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-vdbe" }
 fsqlite-vfs          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-vfs" }
 fsqlite-wal          = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-wal" }
-fastmcp-rust         = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp" }
+fsqlite-ext-icu      = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-icu" }
+fsqlite-ext-misc     = { git = "https://github.com/Dicklesworthstone/frankensqlite", package = "fsqlite-ext-misc" }
+fastmcp-rust         = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", package = "fastmcp-rust" }
 
 [lints.rust]
 unsafe_code = "forbid"
