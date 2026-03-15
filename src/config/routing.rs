@@ -251,9 +251,9 @@ pub fn follow_redirects(start: &Path, max_depth: usize) -> Result<PathBuf> {
         )));
     }
 
-    if current.file_name().is_none_or(|name| name != ".beads") {
+    if current.file_name().is_none_or(|name| !super::is_beads_dir_name(name)) {
         return Err(BeadsError::Config(format!(
-            "Redirect target must be a .beads directory: {}",
+            "Redirect target must be a .beads or _beads directory: {}",
             current.display()
         )));
     }
@@ -363,8 +363,8 @@ fn resolve_route_entry(
             base_dir.join(path)
         };
 
-        // Check if it's a .beads directory or a project root
-        if resolved.file_name().is_some_and(|n| n == ".beads") {
+        // Check if it's a .beads/_beads directory or a project root
+        if resolved.file_name().is_some_and(super::is_beads_dir_name) {
             resolved
         } else {
             resolved.join(".beads")

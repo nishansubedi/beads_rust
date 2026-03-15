@@ -4,7 +4,20 @@ use crate::storage::SqliteStorage;
 use crate::util::db_path;
 use rich_rust::prelude::*;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Resolve the beads directory for init.
+///
+/// Honors `BEADS_DIR` env var if set, otherwise falls back to `base_dir/.beads`.
+fn resolve_init_beads_dir(base_dir: &Path) -> PathBuf {
+    if let Ok(value) = std::env::var("BEADS_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    base_dir.join(".beads")
+}
 
 /// Execute the init command.
 ///
@@ -19,7 +32,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
-    let beads_dir = base_dir.join(".beads");
+    let beads_dir = resolve_init_beads_dir(base_dir);
 
     let mut created_dir = false;
     if beads_dir.exists() {
@@ -168,7 +181,7 @@ redirect
         if let Some(p) = prefix_set.as_deref() {
             println!("Prefix set to: {p}");
         }
-        println!("Initialized beads workspace in .beads/");
+        println!("Initialized beads workspace in {}", beads_dir.display());
     }
 
     Ok(())

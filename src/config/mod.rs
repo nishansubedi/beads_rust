@@ -31,6 +31,14 @@ use std::str::FromStr;
 use tempfile::tempdir;
 use tracing::warn;
 
+/// Check whether a directory name is a valid beads directory name.
+///
+/// Accepts `.beads` (default) and `_beads` (for monorepos that
+/// disallow dot-directories).
+pub fn is_beads_dir_name(name: &std::ffi::OsStr) -> bool {
+    name == ".beads" || name == "_beads"
+}
+
 /// Default database filename used when metadata is missing.
 const DEFAULT_DB_FILENAME: &str = "beads.db";
 /// Default JSONL filename used when metadata is missing.
@@ -245,6 +253,10 @@ fn discover_beads_dir_candidate_with_env(
         if candidate.is_dir() {
             return Ok(candidate);
         }
+        let candidate_underscore = current.join("_beads");
+        if candidate_underscore.is_dir() {
+            return Ok(candidate_underscore);
+        }
 
         if !current.pop() {
             break;
@@ -449,20 +461,20 @@ fn resolve_explicit_beads_dir(path: &Path, source: &str) -> Result<PathBuf> {
 fn beads_dir_from_db_path(db_path: &Path) -> Option<PathBuf> {
     let mut current = db_path.to_path_buf();
 
-    if current.file_name().is_some_and(|n| n == ".beads") {
+    if current.file_name().is_some_and(is_beads_dir_name) {
         return Some(current);
     }
 
     if current.is_file() {
         current.pop();
-        if current.file_name().is_some_and(|n| n == ".beads") {
+        if current.file_name().is_some_and(is_beads_dir_name) {
             return Some(current);
         }
     }
 
     db_path
         .ancestors()
-        .find(|ancestor| ancestor.file_name().is_some_and(|n| n == ".beads"))
+        .find(|ancestor| ancestor.file_name().is_some_and(is_beads_dir_name))
         .map(Path::to_path_buf)
 }
 
@@ -1997,8 +2009,10 @@ pub fn external_project_db_paths(
     let mut db_paths = HashMap::new();
 
     for (name, path) in projects {
-        let beads_path = if path.file_name().is_some_and(|name| name == ".beads") {
+        let beads_path = if path.file_name().is_some_and(is_beads_dir_name) {
             path.clone()
+        } else if path.join("_beads").is_dir() {
+            path.join("_beads")
         } else {
             path.join(".beads")
         };

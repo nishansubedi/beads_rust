@@ -992,6 +992,73 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     Ok(())
 }
 
+/// Check for NULL values in NOT NULL columns that should have DEFAULTs.
+///
+/// Detects rows inserted before the `DEFAULT ''` was added to the schema
+/// (e.g., events.actor or comments.author without DEFAULT).
+fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    let queries: &[(&str, &str, &str)] = &[
+        (
+            "events",
+            "actor",
+            "UPDATE events SET actor = '' WHERE actor IS NULL",
+        ),
+        (
+            "events",
+            "created_at",
+            "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL",
+        ),
+        (
+            "comments",
+            "created_at",
+            "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL",
+        ),
+    ];
+
+    let mut null_findings = Vec::new();
+
+    for (table, column, fix_sql) in queries {
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} IS NULL"
+        );
+        match conn.query_row(&count_sql) {
+            Ok(row) => {
+                let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+                if count > 0 {
+                    null_findings.push(serde_json::json!({
+                        "table": table,
+                        "column": column,
+                        "null_count": count,
+                        "fix_sql": fix_sql,
+                    }));
+                }
+            }
+            Err(_) => {
+                // Table might not exist yet; skip silently
+            }
+        }
+    }
+
+    if null_findings.is_empty() {
+        push_check(checks, "db.null_defaults", CheckStatus::Ok, None, None);
+    } else {
+        let first = &null_findings[0];
+        let table = first["table"].as_str().unwrap_or("?");
+        let column = first["column"].as_str().unwrap_or("?");
+        let count = first["null_count"].as_i64().unwrap_or(0);
+        push_check(
+            checks,
+            "db.null_defaults",
+            CheckStatus::Warn,
+            Some(format!(
+                "{table}.{column} has {count} NULL value(s); fix with: {}",
+                first["fix_sql"].as_str().unwrap_or("see details")
+            )),
+            Some(serde_json::json!({ "findings": null_findings })),
+        );
+    }
+}
+
 fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
     let issue_id = match conn.query_row("SELECT id FROM issues ORDER BY id LIMIT 1") {
         Ok(row) => row
@@ -1824,6 +1891,7 @@ fn inspect_existing_doctor_database(
                 &err,
             );
         }
+        check_null_defaults(&conn, checks);
         check_integrity(&conn, checks);
         if let Err(err) = check_db_count(&conn, jsonl_count, checks) {
             push_inspection_error(
