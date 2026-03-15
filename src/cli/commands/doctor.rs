@@ -997,21 +997,26 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
 /// Detects rows inserted before the `DEFAULT ''` was added to the schema
 /// (e.g., events.actor or comments.author without DEFAULT).
 fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
+    // NOTE: We use typeof(column) = 'null' instead of column IS NULL because
+    // SQLite's query planner can use partial indexes (e.g., WHERE actor != '')
+    // that cause IS NULL predicates to silently return 0 rows even when NULLs
+    // exist in the table.  typeof() bypasses the index and checks the actual
+    // storage class.  See issue #177 for details.
     let queries: &[(&str, &str, &str)] = &[
         (
             "events",
             "actor",
-            "UPDATE events SET actor = '' WHERE actor IS NULL",
+            "UPDATE events SET actor = '' WHERE typeof(actor) = 'null'",
         ),
         (
             "events",
             "created_at",
-            "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL",
+            "UPDATE events SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
         ),
         (
             "comments",
             "created_at",
-            "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL",
+            "UPDATE comments SET created_at = CURRENT_TIMESTAMP WHERE typeof(created_at) = 'null'",
         ),
     ];
 
@@ -1019,7 +1024,7 @@ fn check_null_defaults(conn: &Connection, checks: &mut Vec<CheckResult>) {
 
     for (table, column, fix_sql) in queries {
         let count_sql = format!(
-            "SELECT COUNT(*) FROM {table} WHERE {column} IS NULL"
+            "SELECT COUNT(*) FROM {table} WHERE typeof({column}) = 'null'"
         );
         match conn.query_row(&count_sql) {
             Ok(row) => {
