@@ -9,6 +9,7 @@ use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig};
+use crate::validation::LabelValidator;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -75,27 +76,15 @@ struct RenameResult {
     affected_issues: usize,
 }
 
-/// Validate a label name.
-///
-/// Labels must be alphanumeric with dashes and underscores allowed.
+/// Validate a label name: same character rules as `create`/`update`
+/// (`LabelValidator::validate_chars`), but no length limit.
 fn validate_label(label: &str) -> Result<()> {
     if label.is_empty() {
         return Err(BeadsError::validation("label", "label cannot be empty"));
     }
-
-    // Validate characters: alphanumeric, dash, underscore, colon (for namespacing)
-    for c in label.chars() {
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != ':' {
-            return Err(BeadsError::validation(
-                "label",
-                format!(
-                    "Invalid label '{label}': only alphanumeric, dash, underscore, and colon allowed"
-                ),
-            ));
-        }
-    }
-
-    Ok(())
+    LabelValidator::validate_chars(label).map_err(|e| {
+        BeadsError::validation("label", format!("Invalid label '{label}': {}", e.message))
+    })
 }
 
 /// Parse issues and label from positional args.
@@ -855,6 +844,15 @@ mod tests {
         assert!(validate_label("has space").is_err());
         assert!(validate_label("special@char").is_err());
         assert!(validate_label("dot.not.allowed").is_err());
+        assert!(validate_label("dir:").is_err());
+        assert!(validate_label("team:/backend").is_err());
+    }
+
+    #[test]
+    fn test_validate_label_allows_dir_paths() {
+        assert!(validate_label("dir:/Users/me/code/heim").is_ok());
+        assert!(validate_label("add-dir:~/vault").is_ok());
+        assert!(validate_label("plugin-dir:~/code/heim/odin").is_ok());
     }
 
     #[test]

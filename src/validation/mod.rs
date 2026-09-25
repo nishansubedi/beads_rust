@@ -200,6 +200,13 @@ impl DependencyValidator {
     }
 }
 
+/// Label prefixes whose value is a filesystem path (muninn job context: working
+/// dir, context dirs, plugin dirs). Their values may also contain `/`, `.`, `~`.
+pub const PATH_LABEL_PREFIXES: [&str; 3] = ["dir:", "add-dir:", "plugin-dir:"];
+
+const MAX_LABEL_LEN: usize = 50;
+const MAX_PATH_LABEL_LEN: usize = 255;
+
 /// Validates a single label value.
 pub struct LabelValidator;
 
@@ -214,20 +221,49 @@ impl LabelValidator {
             return Err(ValidationError::new("label", "cannot be empty"));
         }
 
-        if label.len() > 50 {
-            return Err(ValidationError::new("label", "exceeds 50 characters"));
-        }
-
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
-        {
+        let path = PATH_LABEL_PREFIXES
+            .iter()
+            .find_map(|prefix| label.strip_prefix(prefix));
+        let max_len = if path.is_some() {
+            MAX_PATH_LABEL_LEN
+        } else {
+            MAX_LABEL_LEN
+        };
+        if label.len() > max_len {
             return Err(ValidationError::new(
                 "label",
-                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
+                format!("exceeds {max_len} characters"),
             ));
         }
 
+        Self::validate_chars(label)
+    }
+
+    /// Validate only the characters of a label (no length limit).
+    ///
+    /// Alphanumeric, `-`, `_`, `:` everywhere; path labels (`dir:`, `add-dir:`,
+    /// `plugin-dir:`) may also use `/`, `.`, `~` in a non-empty value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ValidationError` if the label contains disallowed characters.
+    pub fn validate_chars(label: &str) -> Result<(), ValidationError> {
+        let is_label_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':';
+        let is_path_char = |c: char| is_label_char(c) || c == '/' || c == '.' || c == '~';
+        let valid = PATH_LABEL_PREFIXES
+            .iter()
+            .find_map(|prefix| label.strip_prefix(prefix))
+            .map_or_else(
+                || label.chars().all(is_label_char),
+                |path| !path.is_empty() && path.chars().all(is_path_char),
+            );
+        if !valid {
+            return Err(ValidationError::new(
+                "label",
+                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed; \
+                 dir:, add-dir: and plugin-dir: paths may also use / . ~)",
+            ));
+        }
         Ok(())
     }
 }
@@ -500,6 +536,41 @@ mod tests {
     #[test]
     fn label_validation_allows_namespaced_labels() {
         assert!(LabelValidator::validate("team:backend").is_ok());
+    }
+
+    #[test]
+    fn label_validation_allows_paths_in_dir_labels() {
+        assert!(LabelValidator::validate("dir:/Users/me/code/heim").is_ok());
+        assert!(LabelValidator::validate("dir:~/code/heim").is_ok());
+        assert!(LabelValidator::validate("add-dir:~/vault").is_ok());
+        assert!(LabelValidator::validate("plugin-dir:/home/me/code/heim/odin").is_ok());
+        assert!(LabelValidator::validate("dir:/home/me/.config/my_app-2").is_ok());
+    }
+
+    #[test]
+    fn label_validation_allows_long_path_labels_up_to_limit() {
+        let long_path = format!("dir:/{}", "a".repeat(200));
+        assert!(LabelValidator::validate(&long_path).is_ok());
+        let too_long = format!("dir:/{}", "a".repeat(260));
+        assert_eq!(
+            LabelValidator::validate(&too_long).unwrap_err().field,
+            "label"
+        );
+        assert!(LabelValidator::validate(&"a".repeat(60)).is_err());
+    }
+
+    #[test]
+    fn label_validation_keeps_path_chars_out_of_other_labels() {
+        assert!(LabelValidator::validate("team:/backend").is_err());
+        assert!(LabelValidator::validate("v1.2").is_err());
+        assert!(LabelValidator::validate("mydir:/tmp").is_err());
+    }
+
+    #[test]
+    fn label_validation_rejects_bad_dir_labels() {
+        assert!(LabelValidator::validate("dir:").is_err());
+        assert!(LabelValidator::validate("dir:/my project").is_err());
+        assert!(LabelValidator::validate("dir:/tmp;rm").is_err());
     }
 
     #[test]
