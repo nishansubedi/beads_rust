@@ -2648,6 +2648,19 @@ fn determine_action(
                 });
             }
 
+            // An incoming tombstone wins unless the local copy was edited after
+            // the deletion. Compared against deleted_at, not just updated_at:
+            // older deletes never bumped updated_at, so their tombstones tie a
+            // live local copy and would otherwise lose the tie forever.
+            if incoming.status == crate::model::Status::Tombstone {
+                let deleted_at = incoming.deleted_at.unwrap_or(incoming.updated_at);
+                if existing_meta.updated_at <= deleted_at {
+                    return Ok(CollisionAction::Update {
+                        existing_id: existing_id.clone(),
+                    });
+                }
+            }
+
             // If force_upsert is enabled, always update (skip timestamp comparison)
             if force_upsert {
                 return Ok(CollisionAction::Update {
@@ -5166,6 +5179,54 @@ mod tests {
         if let CollisionAction::Skip { reason } = action {
             assert!(reason.contains("Tombstone protection"));
         }
+    }
+
+    #[test]
+    fn test_determine_action_incoming_tombstone_wins_tie() {
+        // A tombstone from an older delete that never bumped updated_at: same
+        // updated_at as the live local copy, later deleted_at.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let existing = make_issue_at("bd-1", "Existing", fixed_time(100));
+        storage.create_issue(&existing, "test").unwrap();
+
+        let collision = CollisionResult::Match {
+            existing_id: "bd-1".to_string(),
+            match_type: MatchType::Id,
+            phase: 2,
+        };
+        let (_, _, meta_by_id) = build_collision_maps(&storage);
+
+        let mut tombstone = make_issue_at("bd-1", "Existing", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(150));
+        let action = determine_action(&collision, &tombstone, &meta_by_id, false).unwrap();
+        assert!(
+            matches!(action, CollisionAction::Update { .. }),
+            "expected incoming tombstone to win the tie"
+        );
+    }
+
+    #[test]
+    fn test_determine_action_local_edit_after_delete_survives_tombstone() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let existing = make_issue_at("bd-1", "Edited after delete", fixed_time(200));
+        storage.create_issue(&existing, "test").unwrap();
+
+        let collision = CollisionResult::Match {
+            existing_id: "bd-1".to_string(),
+            match_type: MatchType::Id,
+            phase: 2,
+        };
+        let (_, _, meta_by_id) = build_collision_maps(&storage);
+
+        let mut tombstone = make_issue_at("bd-1", "Existing", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(150));
+        let action = determine_action(&collision, &tombstone, &meta_by_id, false).unwrap();
+        assert!(
+            matches!(action, CollisionAction::Skip { .. }),
+            "expected local edit after the delete to be kept"
+        );
     }
 
     #[test]
