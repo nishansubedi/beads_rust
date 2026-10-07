@@ -6308,28 +6308,20 @@ impl SqliteStorage {
 
         for comment in comments {
             let created_at = comment.created_at.to_rfc3339();
-            let colliding_issue_id = if comment.id > 0 {
-                self.conn
+            // This issue's own rows were deleted above, so any row still holding
+            // this id belongs to another issue or was auto-assigned earlier in
+            // this loop (a reassigned comment can land on a later comment's id).
+            // Either way the id is taken: fall back to a fresh one.
+            let id_taken = comment.id > 0
+                && !self
+                    .conn
                     .query_with_params(
-                        "SELECT issue_id FROM comments WHERE id = ? LIMIT 1",
+                        "SELECT 1 FROM comments WHERE id = ? LIMIT 1",
                         &[SqliteValue::from(comment.id)],
                     )?
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        row.get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(str::to_string)
-                    })
-            } else {
-                None
-            };
+                    .is_empty();
 
-            if colliding_issue_id
-                .as_deref()
-                .is_some_and(|existing_issue_id| existing_issue_id != issue_id)
-                || comment.id <= 0
-            {
+            if id_taken || comment.id <= 0 {
                 self.conn.execute_with_params(
                     "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
                     &[
@@ -7624,6 +7616,70 @@ mod tests {
         assert_ne!(comments_a[0].id, existing_comment.id);
 
         let comments_b = storage.get_comments("bd-c-import-b").unwrap();
+        assert_eq!(comments_b, vec![existing_comment]);
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_reassigned_id_does_not_collide_with_later_comment() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue(
+            "bd-c-reassign-a",
+            "Import target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue_b = make_issue(
+            "bd-c-reassign-b",
+            "Existing comment owner",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        let existing_comment = storage
+            .add_comment("bd-c-reassign-b", "bob", "Existing comment")
+            .unwrap();
+
+        // The first imported comment collides with issue B and is reassigned the
+        // next free id, which is exactly the id the second imported comment carries
+        // (two machines numbering comments independently).
+        let next_free_id = existing_comment.id + 1;
+        let imported = [
+            crate::model::Comment {
+                id: existing_comment.id,
+                issue_id: "bd-c-reassign-a".to_string(),
+                author: "alice".to_string(),
+                body: "First imported".to_string(),
+                created_at: t1 + chrono::Duration::minutes(5),
+            },
+            crate::model::Comment {
+                id: next_free_id,
+                issue_id: "bd-c-reassign-a".to_string(),
+                author: "alice".to_string(),
+                body: "Second imported".to_string(),
+                created_at: t1 + chrono::Duration::minutes(6),
+            },
+        ];
+        storage
+            .sync_comments_for_import("bd-c-reassign-a", &imported)
+            .unwrap();
+
+        let comments_a = storage.get_comments("bd-c-reassign-a").unwrap();
+        let bodies: Vec<&str> = comments_a.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["First imported", "Second imported"]);
+        assert_ne!(comments_a[0].id, comments_a[1].id);
+        assert!(comments_a.iter().all(|c| c.id != existing_comment.id));
+
+        let comments_b = storage.get_comments("bd-c-reassign-b").unwrap();
         assert_eq!(comments_b, vec![existing_comment]);
     }
 
