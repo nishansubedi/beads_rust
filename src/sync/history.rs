@@ -15,6 +15,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether [`HistoryConfig::default`] keeps export backups. On unless the
+/// embedding application turns it off with [`set_backups_by_default`].
+static BACKUPS_BY_DEFAULT: AtomicBool = AtomicBool::new(true);
+
+/// Turn export backups on or off for every later [`HistoryConfig::default`]
+/// in this process: every export path (auto-flush, `sync --flush-only`,
+/// incremental exports) builds its history config from the default.
+///
+/// For an application that keeps its own history of `issues.jsonl` (git, a
+/// change log). With backups on, every export first copies the whole old file
+/// into `.br_history/`, up to 100 copies: on a workspace that exports on every
+/// write, that is 100 full copies covering only the last hour or two.
+pub fn set_backups_by_default(enabled: bool) {
+    BACKUPS_BY_DEFAULT.store(enabled, Ordering::Relaxed);
+}
 
 /// Configuration for history backups.
 #[derive(Debug, Clone)]
@@ -27,7 +44,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: BACKUPS_BY_DEFAULT.load(Ordering::Relaxed),
             max_count: 100,
             max_age_days: 30,
         }
