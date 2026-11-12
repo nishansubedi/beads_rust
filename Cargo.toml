@@ -1,8 +1,8 @@
 [package]
 name = "beads_rust"
-version = "0.1.28"
+version = "0.1.29"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Agent-first issue tracker (SQLite + JSONL)"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/beads_rust"
@@ -45,7 +45,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
 clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
 
 # Database (rusqlite with bundled SQLite)
-rusqlite = { version = "0.38", features = ["bundled", "modern_sqlite"] }
+rusqlite = { version = "0.42", features = ["bundled", "modern_sqlite"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }

@@ -145,3 +145,25 @@ cargo test --lib
 - `cargo test --lib`: 775 passed, 0 failed
 - `cargo test --test conformance`: 320 passed, 0 failed, 26 ignored
 - `cargo test` (full): 1 pre-existing failure in `e2e_close_blocked_requires_force` (unrelated to upgrades)
+
+---
+---
+
+# Upgrade Session: 2026-11-12
+
+**Date:** 2026-11-12  |  **Project:** beads_rust 0.1.29  |  **Language:** Rust
+
+### rusqlite: 0.38.0 -> 0.42.0 (bundled SQLite 3.51.1 -> 3.54.1)
+- **Why:** SQLite 3.51.0 and 3.51.1 deadlock a process whose threads open and close the same WAL
+  file at once: a lock-order inversion between the unix VFS's global mutex and a file's inode
+  mutex (`unixLock` -> `unixIsSharingShmNode` vs `findReusableFd`), fixed in 3.51.2. An
+  embedding application (muninn) can't move its own rusqlite past 0.38 while this crate holds
+  it there, since only one crate in a build may link `sqlite3`.
+- **Breaking:** none in this crate's usage. It compiled unchanged; no warnings.
+- **rust-version:** 1.88 -> 1.89, rusqlite 0.41's MSRV.
+- **Transitive:** libsqlite3-sys 0.36.0 -> 0.40.0, hashlink 0.11.0 -> 0.12.2, thiserror
+  2.0.18 -> 2.0.21; wasm-only: sqlite-wasm-rs 0.5.2 -> 0.6.3, rsqlite-vfs 0.1.0 -> 0.2.0.
+- **Tests:** `cargo test --lib -- --test-threads=1`: 1078 passed, 34 failed. The same 34 fail
+  at ed68f7f on rusqlite 0.38 (macOS temp-dir symlinks, cwd-dependent fixtures, and others).
+  The storage_*, jsonl_import_export and history_backups_switch suites: the same pass and
+  fail counts before and after.
