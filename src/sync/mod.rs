@@ -1332,9 +1332,15 @@ pub fn export_to_jsonl_with_policy(
     // Safety checks
     if !config.force && output_path.exists() {
         let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
+        // Ids hard-deleted (purged) on purpose are expected to leave the JSONL on
+        // this export; they are not data loss (#405).
+        let purged_ids = storage.get_purged_ids_pending_export()?;
 
         // Check 1: prevent exporting empty database over non-empty JSONL
-        if issues.is_empty() && jsonl_count > 0 {
+        if issues.is_empty()
+            && jsonl_count > 0
+            && jsonl_ids.iter().any(|id| !purged_ids.contains(id))
+        {
             return Err(BeadsError::Config(format!(
                 "Refusing to export empty database over non-empty JSONL file.\n\
                  Database has 0 issues, JSONL has {jsonl_count} lines.\n\
@@ -1346,7 +1352,10 @@ pub fn export_to_jsonl_with_policy(
         // Check 2: prevent exporting stale database that would lose issues
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
-            let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
+            let missing: Vec<_> = jsonl_ids
+                .difference(&db_ids)
+                .filter(|id| !purged_ids.contains(id.as_str()))
+                .collect();
 
             if !missing.is_empty() {
                 let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
@@ -2037,6 +2046,8 @@ pub fn finalize_export(
 
         // Clear force-flush flag if it was set
         storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
+        // The published JSONL no longer holds the purged issues (#405).
+        storage.clear_purged_ids_pending_export_in_tx()?;
 
         Ok(())
     })?;
@@ -2200,6 +2211,9 @@ fn finalize_incremental_auto_flush(
             })?;
             record_jsonl_mtime_in_tx(storage, jsonl_path)?;
         }
+        // The purged-pending-export marker stays (#405): this path rewrites only dirty
+        // lines, so a purged issue's line is still in the JSONL. It runs only without
+        // `needs_flush`, which every purge sets; the full export clears both.
         storage.execute_raw("DELETE FROM metadata WHERE key = 'needs_flush'")?;
         Ok(())
     })?;
@@ -2474,9 +2488,14 @@ pub fn auto_flush(
         }
     }
 
-    // Configure export with defaults, including beads_dir for path validation
+    // Configure export with defaults, including beads_dir for path validation.
+    // `needs_flush` is deliberately not passed as `force` (#405, upstream beabee6d):
+    // that turned off the exporter's data-loss guards, so the flush after a hard delete
+    // erased from the JSONL every issue the database had never imported. The purge
+    // that used to need `force` is covered by the purged-pending-export marker, which
+    // the guard leaves out of its loss check.
     let export_config = ExportConfig {
-        force: needs_flush && dirty_count == 0,
+        force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
         ..Default::default()
@@ -2584,11 +2603,18 @@ pub enum CollisionAction {
 }
 
 /// Detect collision for an incoming issue using the 4-phase algorithm with preloaded metadata maps.
+///
+/// `incoming_ids` holds every issue id the incoming JSONL carries. Phase 3 (the
+/// content-hash match) applies only when the matched local issue is *not* among
+/// them: a local issue the JSONL still carries under its own id was not renamed,
+/// so an incoming issue with a new id and the same content is a different issue,
+/// not that one under a new name.
 fn detect_collision(
     incoming: &Issue,
     id_by_ext_ref: &std::collections::HashMap<String, String>,
     id_by_hash: &std::collections::HashMap<String, String>,
     meta_by_id: &std::collections::HashMap<String, crate::storage::sqlite::IssueMetadata>,
+    incoming_ids: &HashSet<String>,
     computed_hash: &str,
 ) -> CollisionResult {
     // Phase 1: External reference match
@@ -2611,8 +2637,16 @@ fn detect_collision(
         };
     }
 
-    // Phase 3: Content hash match
-    if let Some(existing_id) = id_by_hash.get(computed_hash) {
+    // Phase 3: Content hash match, for a renamed issue only.
+    //
+    // Skipped when the matched local id is itself in the incoming JSONL. Many issues
+    // legitimately share content (a workflow's run beads, repeated step beads); folding
+    // a new one onto its local twin recorded a rename, so the new issue never reached
+    // the database, and its timestamps, labels, dependencies and comments replaced the
+    // twin's. Each import then folded the next twin (bd-16b1o.92).
+    if let Some(existing_id) = id_by_hash.get(computed_hash)
+        && !incoming_ids.contains(existing_id)
+    {
         return CollisionResult::Match {
             existing_id: existing_id.clone(),
             match_type: MatchType::ContentHash,
@@ -3006,6 +3040,10 @@ pub fn import_from_jsonl(
         meta_by_id.insert(issue_id, m);
     }
 
+    // Every id the JSONL carries, for phase 3 of collision detection: a local issue
+    // the JSONL still carries under its own id is never the target of a rename.
+    let incoming_ids: HashSet<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+
     // Phase 1: Scan and Resolve IDs
     let mut seen_external_refs: HashSet<String> = HashSet::new();
     let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -3050,6 +3088,7 @@ pub fn import_from_jsonl(
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &incoming_ids,
             &computed_hash,
         );
 
@@ -4711,6 +4750,7 @@ mod tests {
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &HashSet::from([incoming.id.clone()]),
             &computed_hash,
         );
         assert!(
@@ -5025,6 +5065,7 @@ mod tests {
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &HashSet::from([incoming.id.clone()]),
             &computed_hash,
         );
         assert!(
@@ -5064,6 +5105,7 @@ mod tests {
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &HashSet::from([incoming.id.clone()]),
             &computed_hash,
         );
         assert!(
@@ -5103,6 +5145,7 @@ mod tests {
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &HashSet::from([incoming.id.clone()]),
             &computed_hash,
         );
 
@@ -5138,6 +5181,7 @@ mod tests {
             &id_by_ext_ref,
             &id_by_hash,
             &meta_by_id,
+            &HashSet::from([incoming.id.clone()]),
             &computed_hash,
         );
 
@@ -5155,6 +5199,467 @@ mod tests {
             assert_eq!(match_type, MatchType::Id);
             assert_eq!(phase, 2);
         }
+    }
+
+    // ===== bd-16b1o.92: the content-hash match never folds onto an issue the JSONL carries =====
+
+    /// A closed workflow-run bead as muninn writes them: every run of one workflow
+    /// has the same content (title, status, type, creator), so the same content hash.
+    fn wf_run(id: &str, created_secs: i64, updated_secs: i64) -> Issue {
+        let mut issue = make_issue_at(id, "wf:mail-review run", fixed_time(updated_secs));
+        issue.created_at = fixed_time(created_secs);
+        issue.created_by = Some("workflow:mail-review".to_string());
+        issue.status = Status::Closed;
+        issue.closed_at = Some(fixed_time(updated_secs));
+        issue
+    }
+
+    fn with_parent(mut issue: Issue, parent: &str, secs: i64) -> Issue {
+        issue.dependencies.push(crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: parent.to_string(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: fixed_time(secs),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        });
+        issue
+    }
+
+    fn with_comment(mut issue: Issue, id: i64, text: &str, secs: i64) -> Issue {
+        issue.comments.push(Comment {
+            id,
+            issue_id: issue.id.clone(),
+            author: "huginn".to_string(),
+            body: text.to_string(),
+            created_at: fixed_time(secs),
+        });
+        issue
+    }
+
+    fn write_jsonl(path: &Path, issues: &[&Issue]) {
+        let mut lines = String::new();
+        for issue in issues {
+            lines.push_str(&serde_json::to_string(issue).unwrap());
+            lines.push('\n');
+        }
+        fs::write(path, lines).unwrap();
+    }
+
+    fn parents_of(storage: &SqliteStorage, id: &str) -> Vec<String> {
+        storage
+            .get_dependencies_full(id)
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.depends_on_id)
+            .collect()
+    }
+
+    fn comment_texts(storage: &SqliteStorage, id: &str) -> Vec<String> {
+        storage
+            .get_comments(id)
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.body)
+            .collect()
+    }
+
+    /// Every row an import writes, in a stable order, for comparing two states.
+    fn dump_import_tables(storage: &SqliteStorage) -> String {
+        [
+            "SELECT * FROM issues ORDER BY id",
+            "SELECT * FROM labels ORDER BY issue_id, label",
+            "SELECT * FROM dependencies ORDER BY issue_id, depends_on_id",
+            "SELECT * FROM comments ORDER BY id",
+            "SELECT * FROM events ORDER BY id",
+        ]
+        .iter()
+        .map(|sql| format!("{:?}", storage.execute_raw_query(sql).unwrap()))
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
+    /// Machine one has run `bd-aaa`; machine two's run `bd-bbb` has identical content
+    /// and arrives through the merged JSONL, alongside a bead that depends on it.
+    /// Before the fix the import matched `bd-bbb` to `bd-aaa` by content hash: the
+    /// newer `bd-bbb` overwrote `bd-aaa`'s row and relations, the older one was skipped,
+    /// and either way `bd-bbb` never reached the database.
+    fn assert_two_identical_runs_both_survive(incoming_newer: bool) {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let epic_one = make_issue_at("bd-epic1", "Mail review epic one", fixed_time(1_000));
+        let epic_two = make_issue_at("bd-epic2", "Mail review epic two", fixed_time(1_000));
+        let mut local_run = with_comment(
+            with_parent(wf_run("bd-aaa", 2_000, 2_100), "bd-epic1", 2_000),
+            1,
+            "machine one's run",
+            2_050,
+        );
+        local_run.labels = vec!["machine:one".to_string()];
+        let (created, updated) = if incoming_newer {
+            (3_000, 3_100)
+        } else {
+            (500, 600)
+        };
+        let mut remote_run = with_comment(
+            with_parent(wf_run("bd-bbb", created, updated), "bd-epic2", created),
+            2,
+            "machine two's run",
+            created + 50,
+        );
+        remote_run.labels = vec!["machine:two".to_string()];
+        let mut follower = make_issue_at(
+            "bd-follow",
+            "Depends on machine two's run",
+            fixed_time(4_000),
+        );
+        follower.dependencies.push(crate::model::Dependency {
+            issue_id: "bd-follow".to_string(),
+            depends_on_id: "bd-bbb".to_string(),
+            dep_type: crate::model::DependencyType::Related,
+            created_at: fixed_time(4_000),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        assert_eq!(
+            crate::util::content_hash(&local_run),
+            crate::util::content_hash(&remote_run),
+            "the two runs must share a content hash for this test to mean anything"
+        );
+
+        // Machine one's state: its own JSONL imported.
+        write_jsonl(&path, &[&epic_one, &local_run]);
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        // The merged JSONL from both machines.
+        write_jsonl(
+            &path,
+            &[&epic_one, &epic_two, &local_run, &remote_run, &follower],
+        );
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(
+            result.created_count, 3,
+            "bd-epic2, bd-bbb and bd-follow are new"
+        );
+        assert_eq!(storage.count_issues().unwrap(), 5);
+
+        let aaa = storage
+            .get_issue("bd-aaa")
+            .unwrap()
+            .expect("bd-aaa survives");
+        let bbb = storage
+            .get_issue("bd-bbb")
+            .unwrap()
+            .expect("bd-bbb reaches the database");
+        assert_eq!(aaa.created_at, local_run.created_at);
+        assert_eq!(aaa.updated_at, local_run.updated_at);
+        assert_eq!(aaa.closed_at, local_run.closed_at);
+        assert_eq!(bbb.created_at, remote_run.created_at);
+        assert_eq!(bbb.updated_at, remote_run.updated_at);
+        assert_eq!(bbb.closed_at, remote_run.closed_at);
+
+        assert_eq!(parents_of(&storage, "bd-aaa"), vec!["bd-epic1"]);
+        assert_eq!(parents_of(&storage, "bd-bbb"), vec!["bd-epic2"]);
+        assert_eq!(parents_of(&storage, "bd-follow"), vec!["bd-bbb"]);
+        assert_eq!(storage.get_labels("bd-aaa").unwrap(), vec!["machine:one"]);
+        assert_eq!(storage.get_labels("bd-bbb").unwrap(), vec!["machine:two"]);
+        assert_eq!(comment_texts(&storage, "bd-aaa"), vec!["machine one's run"]);
+        assert_eq!(comment_texts(&storage, "bd-bbb"), vec!["machine two's run"]);
+    }
+
+    #[test]
+    fn test_import_keeps_a_newer_identical_content_bead_from_another_machine() {
+        assert_two_identical_runs_both_survive(true);
+    }
+
+    #[test]
+    fn test_import_keeps_an_older_identical_content_bead_from_another_machine() {
+        assert_two_identical_runs_both_survive(false);
+    }
+
+    /// The rotation seen on the Mac: the database holds one run, the JSONL brings more
+    /// runs with the same content. Before the fix each import folded a run onto a twin
+    /// and the next import picked the next twin, so the database never settled.
+    #[test]
+    fn test_reimport_with_identical_content_beads_is_idempotent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let epic = make_issue_at("bd-epic", "Epic", fixed_time(1_000));
+        let runs: Vec<Issue> = (0..4)
+            .map(|n| {
+                with_comment(
+                    with_parent(
+                        wf_run(&format!("bd-run{n}"), 2_000 + n * 100, 2_050 + n * 100),
+                        "bd-epic",
+                        2_000,
+                    ),
+                    10 + n,
+                    &format!("run {n}"),
+                    2_010 + n * 100,
+                )
+            })
+            .collect();
+
+        // This machine has the epic and the first run.
+        write_jsonl(&path, &[&epic, &runs[0]]);
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        // The merged JSONL adds three more runs with the same content.
+        let mut all: Vec<&Issue> = vec![&epic];
+        all.extend(runs.iter());
+        write_jsonl(&path, &all);
+        let first =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(first.created_count, 3);
+        assert_eq!(storage.count_issues().unwrap(), 5);
+        let after_first = dump_import_tables(&storage);
+
+        for _ in 0..3 {
+            let again =
+                import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd"))
+                    .unwrap();
+            assert_eq!(again.created_count, 0);
+            assert_eq!(again.updated_count, 0);
+            assert_eq!(
+                dump_import_tables(&storage),
+                after_first,
+                "a re-import changed the database"
+            );
+        }
+        for (n, run) in runs.iter().enumerate() {
+            let stored = storage
+                .get_issue(&run.id)
+                .unwrap()
+                .expect("every run survives");
+            assert_eq!(stored.created_at, run.created_at);
+            assert_eq!(comment_texts(&storage, &run.id), vec![format!("run {n}")]);
+        }
+    }
+
+    /// Upstream's displaced-id case (#512, MatchType::DisplacedId): another machine
+    /// resolved a collision on `bd-p.3` by moving this machine's issue to `bd-p.4`.
+    /// The JSONL carries the other machine's issue at `bd-p.3` and this machine's,
+    /// unchanged, at `bd-p.4`. The moved issue has the old row's content hash, but the
+    /// old id is in the JSONL, so it must arrive at `bd-p.4` as an insert and not
+    /// fold back onto `bd-p.3`.
+    #[test]
+    fn test_import_does_not_fold_a_displaced_issue_back_onto_its_old_id() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let parent = make_issue_at("bd-p", "Parent", fixed_time(1_000));
+        let local = with_comment(
+            with_parent(
+                make_issue_at("bd-p.3", "Local child", fixed_time(2_000)),
+                "bd-p",
+                1_950,
+            ),
+            7,
+            "local note",
+            1_990,
+        );
+        write_jsonl(&path, &[&parent, &local]);
+        import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+
+        // The resolved file: the other machine's child keeps bd-p.3, ours moves to bd-p.4.
+        let remote = with_parent(
+            make_issue_at("bd-p.3", "Remote child", fixed_time(3_000)),
+            "bd-p",
+            2_950,
+        );
+        let mut moved = local.clone();
+        moved.id = "bd-p.4".to_string();
+        for dep in &mut moved.dependencies {
+            dep.issue_id = "bd-p.4".to_string();
+        }
+        for comment in &mut moved.comments {
+            comment.issue_id = "bd-p.4".to_string();
+        }
+        assert_eq!(
+            crate::util::content_hash(&moved),
+            crate::util::content_hash(&local)
+        );
+        write_jsonl(&path, &[&parent, &remote, &moved]);
+
+        let result =
+            import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("bd")).unwrap();
+        assert_eq!(result.created_count, 1, "bd-p.4 is inserted");
+        assert_eq!(storage.count_issues().unwrap(), 3);
+
+        let at_new_id = storage
+            .get_issue("bd-p.4")
+            .unwrap()
+            .expect("bd-p.4 inserted");
+        assert_eq!(at_new_id.title, "Local child");
+        assert_eq!(at_new_id.created_at, local.created_at);
+        assert_eq!(parents_of(&storage, "bd-p.4"), vec!["bd-p"]);
+        assert_eq!(comment_texts(&storage, "bd-p.4"), vec!["local note"]);
+
+        let at_old_id = storage.get_issue("bd-p.3").unwrap().expect("bd-p.3 kept");
+        assert_eq!(at_old_id.title, "Remote child");
+        assert_eq!(comment_texts(&storage, "bd-p.3"), Vec::<String>::new());
+    }
+
+    // ===== #405: the flush after a hard delete keeps the data-loss guards =====
+
+    /// Two issues created and flushed to `<dir>/issues.jsonl`; returns the storage,
+    /// the beads dir and the JSONL path.
+    fn flushed_pair() -> (SqliteStorage, TempDir, PathBuf) {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        storage
+            .create_issue(&make_test_issue("bd-keeper", "Keeper"), "tester")
+            .unwrap();
+        storage
+            .create_issue(&make_test_issue("bd-victim", "Victim"), "tester")
+            .unwrap();
+        let seeded = auto_flush(&mut storage, temp_dir.path(), &jsonl_path, false).unwrap();
+        assert!(seeded.flushed);
+        assert_eq!(count_issues_in_jsonl(&jsonl_path).unwrap(), 2);
+        (storage, temp_dir, jsonl_path)
+    }
+
+    /// The JSONL holds an issue this database never imported (a merged record, or one
+    /// of the beads the content-hash fold kept out, bd-16b1o.92). Before #405 the
+    /// flush after a hard delete ran with `force`, skipped the stale-database guard,
+    /// and rewrote the JSONL from the database: the never-imported issue was erased.
+    #[test]
+    fn test_flush_after_hard_delete_keeps_jsonl_issues_the_database_never_imported() {
+        let (mut storage, temp_dir, jsonl_path) = flushed_pair();
+        let mut merged = make_test_issue("bd-merged1", "Merged from another machine");
+        merged.created_at = fixed_time(1_000);
+        merged.updated_at = fixed_time(1_000);
+        let mut contents = fs::read_to_string(&jsonl_path).unwrap();
+        contents.push_str(&serde_json::to_string(&merged).unwrap());
+        contents.push('\n');
+        fs::write(&jsonl_path, contents).unwrap();
+        assert_eq!(count_issues_in_jsonl(&jsonl_path).unwrap(), 3);
+
+        storage.purge_issue("bd-victim", "tester").unwrap();
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            storage.get_purged_ids_pending_export().unwrap(),
+            HashSet::from(["bd-victim".to_string()])
+        );
+        let before = fs::read_to_string(&jsonl_path).unwrap();
+
+        let err = auto_flush(&mut storage, temp_dir.path(), &jsonl_path, false).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Refusing to export stale database"),
+            "{message}"
+        );
+        assert!(
+            message.contains("bd-merged1"),
+            "the guard names the issue: {message}"
+        );
+        assert!(
+            !message.contains("bd-victim"),
+            "the purged id is not a loss: {message}"
+        );
+
+        assert_eq!(
+            count_issues_in_jsonl(&jsonl_path).unwrap(),
+            3,
+            "no issue left the JSONL"
+        );
+        assert_eq!(
+            fs::read_to_string(&jsonl_path).unwrap(),
+            before,
+            "the JSONL is untouched"
+        );
+    }
+
+    /// The flow the old `force` served still works: the flush after a hard delete
+    /// prunes exactly the purged issue and clears both markers.
+    #[test]
+    fn test_flush_after_hard_delete_prunes_only_the_purged_issue() {
+        let (mut storage, temp_dir, jsonl_path) = flushed_pair();
+
+        storage.purge_issue("bd-victim", "tester").unwrap();
+        let flushed = auto_flush(&mut storage, temp_dir.path(), &jsonl_path, false).unwrap();
+        assert!(flushed.flushed);
+
+        assert_eq!(count_issues_in_jsonl(&jsonl_path).unwrap(), 1);
+        let ids = get_issue_ids_from_jsonl(&jsonl_path).unwrap();
+        assert!(ids.contains("bd-keeper"));
+        assert!(!ids.contains("bd-victim"));
+        assert!(storage.get_purged_ids_pending_export().unwrap().is_empty());
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+    }
+
+    /// Purging the last issue still empties the JSONL without `force`.
+    #[test]
+    fn test_flush_after_purging_every_issue_writes_an_empty_jsonl() {
+        let (mut storage, temp_dir, jsonl_path) = flushed_pair();
+
+        storage.purge_issue("bd-victim", "tester").unwrap();
+        storage.purge_issue("bd-keeper", "tester").unwrap();
+        auto_flush(&mut storage, temp_dir.path(), &jsonl_path, false).unwrap();
+
+        assert_eq!(count_issues_in_jsonl(&jsonl_path).unwrap(), 0);
+        assert!(storage.get_purged_ids_pending_export().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_detect_collision_skips_content_hash_match_on_an_id_the_jsonl_carries() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let mut twin = make_issue_at("bd-twin", "Same Content", fixed_time(100));
+        set_content_hash(&mut twin);
+        storage.upsert_issue_for_import(&twin).unwrap();
+
+        let incoming = make_issue_at("bd-new", "Same Content", fixed_time(300));
+        let computed_hash = crate::util::content_hash(&incoming);
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+
+        // The JSONL also carries bd-twin: bd-new is a different issue.
+        let carried = HashSet::from(["bd-new".to_string(), "bd-twin".to_string()]);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &carried,
+            &computed_hash,
+        );
+        assert!(
+            matches!(collision, CollisionResult::NewIssue),
+            "{collision:?}"
+        );
+
+        // The JSONL no longer carries bd-twin: bd-new may be bd-twin renamed.
+        let renamed = HashSet::from(["bd-new".to_string()]);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &renamed,
+            &computed_hash,
+        );
+        assert!(
+            matches!(
+                &collision,
+                CollisionResult::Match { existing_id, match_type: MatchType::ContentHash, phase: 3 }
+                    if existing_id == "bd-twin"
+            ),
+            "{collision:?}"
+        );
     }
 
     #[test]

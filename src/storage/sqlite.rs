@@ -32,6 +32,12 @@ const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
+/// Metadata key holding a sorted JSON array of issue ids that were hard-deleted
+/// (purged) from the database but may still be in the on-disk JSONL. The exporter's
+/// data-loss guards leave these ids out of their "would lose issues" check, so the
+/// flush after a purge can drop them without `force`, which turned both guards off
+/// (#405, upstream beabee6d). Cleared when an export publishes a JSONL.
+pub(crate) const PURGED_IDS_PENDING_EXPORT_KEY: &str = "purged_ids_pending_export";
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
@@ -1508,6 +1514,10 @@ impl SqliteStorage {
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+
+            // Record the intentional removal, so the exporter's stale-database guard
+            // can tell "purged on purpose" from "never imported" (#405).
+            Self::record_purged_id_pending_export_in_tx(conn, id)?;
 
             ctx.invalidate_cache();
             ctx.force_flush = true;
@@ -5236,6 +5246,75 @@ impl SqliteStorage {
             map.insert(id, (title, priority, status));
         }
         Ok(map)
+    }
+
+    /// The issue ids that were purged (hard-deleted) but not yet flushed out of the
+    /// on-disk JSONL (#405).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the marker is not a JSON array.
+    pub fn get_purged_ids_pending_export(&self) -> Result<HashSet<String>> {
+        let Some(raw) = self
+            .get_metadata(PURGED_IDS_PENDING_EXPORT_KEY)?
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(HashSet::new());
+        };
+        let ids: Vec<String> = serde_json::from_str(&raw)?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Record, inside the purge transaction, that `id` was removed on purpose, so the
+    /// exporter's stale-database guard does not count it as data loss (#405).
+    fn record_purged_id_pending_export_in_tx(conn: &Connection, id: &str) -> Result<()> {
+        let existing = match conn.query_row_with_params(
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+            &[SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY)],
+        ) {
+            Ok(row) => row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from),
+            Err(FrankenError::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut ids: Vec<String> = match existing {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Vec::new(),
+        };
+        if !ids.iter().any(|existing_id| existing_id == id) {
+            ids.push(id.to_string());
+            ids.sort_unstable();
+        }
+        let serialized = serde_json::to_string(&ids)?;
+        conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY)],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            &[
+                SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY),
+                SqliteValue::from(serialized.as_str()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the purged-pending-export marker inside an export's finalizing
+    /// transaction: the JSONL just published no longer holds the purged ids (#405).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn clear_purged_ids_pending_export_in_tx(&self) -> Result<()> {
+        self.conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY)],
+        )?;
+        Ok(())
     }
 
     /// Set metadata (in tx).

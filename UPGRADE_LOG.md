@@ -167,3 +167,61 @@ cargo test --lib
   at ed68f7f on rusqlite 0.38 (macOS temp-dir symlinks, cwd-dependent fixtures, and others).
   The storage_*, jsonl_import_export and history_backups_switch suites: the same pass and
   fail counts before and after.
+
+---
+---
+
+# Upgrade Session: 2026-11-13
+
+**Date:** 2026-11-13  |  **Project:** beads_rust 0.1.29 -> 0.1.30  |  **Language:** Rust
+
+No dependency changes. Two import/export data-loss fixes, for heim bead bd-16b1o.92.
+
+### Import: the content-hash match no longer folds a new issue onto a twin the JSONL carries
+- **Bug:** `detect_collision`'s phase 3 matched an incoming issue with a new id to the first
+  local issue with the same content hash, recorded a rename, and remapped the incoming issue,
+  its dependency sources and targets and its comment owners onto that local id. muninn writes
+  many issues with identical content (a workflow's run beads, repeated step beads), so a new
+  run from another machine never reached the database: if newer it overwrote the twin's row,
+  labels, dependencies and comments; if older it was skipped. The overwrite (DELETE+INSERT)
+  moved the twin to the end of the table, so each import picked the next twin. On one Mac:
+  52 JSONL issues missing from beads.db, 36 rows carrying another issue's timestamps.
+- **Fix:** phase 3 applies only when the matched local id is not itself in the incoming JSONL.
+  A local issue the JSONL still carries under its own id was not renamed. A local issue the
+  JSONL no longer carries can still be matched, as before (the rename case).
+- **Kept:** upstream's displaced-id case (#512): an issue moved to a new id while its old id
+  holds another issue is inserted at the new id, not folded back onto the old one.
+- **Not a schema change:** schema version stays 4; no migration.
+- **Tests (src/sync/mod.rs):** `test_import_keeps_a_newer_identical_content_bead_from_another_machine`,
+  `test_import_keeps_an_older_identical_content_bead_from_another_machine`,
+  `test_reimport_with_identical_content_beads_is_idempotent`,
+  `test_import_does_not_fold_a_displaced_issue_back_onto_its_old_id`,
+  `test_detect_collision_skips_content_hash_match_on_an_id_the_jsonl_carries`. The four import
+  tests fail with the old phase 3 and pass with the fix.
+
+### Export: `needs_flush` no longer turns off the data-loss guards (#405, upstream beabee6d)
+- **Bug:** `auto_flush`, `sync --flush-only` and the no-db flush passed `needs_flush` as
+  `force`. Only a hard delete (`purge_issue`) sets `needs_flush`, so the flush after a hard
+  delete skipped both guards ("Refusing to export empty database", "Refusing to export stale
+  database") and rewrote the JSONL from the database, erasing every JSONL issue the database
+  had never imported.
+- **Fix, ported from beabee6d (rewritten for this fork's sync module):** `force` is only the
+  user's `--force`. `purge_issue` records the purged id in metadata
+  (`purged_ids_pending_export`) in the same transaction; both guards leave those ids out of
+  their loss check; a full export clears the marker. The incremental auto-flush leaves it,
+  since it rewrites only dirty lines and runs only without `needs_flush`.
+- **Tests:** `test_flush_after_hard_delete_keeps_jsonl_issues_the_database_never_imported`
+  (hard delete, flush, count: the flush refuses and the JSONL keeps all 3 issues; fails with
+  the old `force`), `test_flush_after_hard_delete_prunes_only_the_purged_issue`,
+  `test_flush_after_purging_every_issue_writes_an_empty_jsonl`, and
+  `tests/e2e_sync_needs_flush_guard.rs` through the CLI (its refusal test fails with the old
+  `force`).
+
+### Validation
+- `cargo test --lib -- sync:: storage:: config:: --test-threads=1`: 409 passed, 23 failed; at
+  9f5c8b4, 401 passed and the same 23 failed (macOS temp-dir symlinks, cwd-dependent fixtures).
+- `jsonl_import_export`: 156 passed, 2 failed, the same 2 as at 9f5c8b4 (the shared
+  `common::dataset_registry` fixtures). `history_backups_switch`, `repro_collision_labels`:
+  pass. `e2e_sync_needs_flush_guard`: 2 passed.
+- `cargo fmt --check` and `cargo clippy` report nothing in the changed lines; both already
+  fail elsewhere at 9f5c8b4.

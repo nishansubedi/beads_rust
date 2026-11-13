@@ -1147,10 +1147,12 @@ impl OpenStorageResult {
         }
 
         let export_config = ExportConfig {
-            // A no-db hard delete can intentionally remove the last issue.
-            // In that case `purge_issue` leaves no dirty rows, only the force-flush
-            // marker, so allow the empty export that makes JSONL match the storage state.
-            force: needs_flush && dirty_issue_count == 0,
+            // `needs_flush` is deliberately not passed as `force` (#405): that turned
+            // off the exporter's data-loss guards. A no-db hard delete, even of the
+            // last issue, records the purged id, and the guards leave purged ids out
+            // of their loss check, so the export that makes the JSONL match the
+            // storage still goes through.
+            force: false,
             is_default_path: self.paths.jsonl_path == self.paths.beads_dir.join("issues.jsonl"),
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,

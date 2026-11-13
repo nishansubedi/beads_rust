@@ -495,7 +495,12 @@ fn execute_flush(
         let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
-            let mut missing_list = jsonl_ids.difference(&db_ids).cloned().collect::<Vec<_>>();
+            let purged_ids = storage.get_purged_ids_pending_export()?;
+            let mut missing_list = jsonl_ids
+                .difference(&db_ids)
+                .filter(|id| !purged_ids.contains(id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
 
             if !missing_list.is_empty() {
                 missing_list.sort();
@@ -546,9 +551,13 @@ fn execute_flush(
         return Ok(());
     }
 
-    // Configure export
+    // Configure export. `needs_flush` must not stand in for the user's `--force`
+    // (#405, upstream beabee6d): its only job is to get past the nothing-to-do
+    // return above. As `force` it turned off the exporter's data-loss guards, so the
+    // flush after a hard delete erased JSONL issues the database had never imported.
+    // Purged ids are left out of the guard by the purged-pending-export marker.
     let export_config = ExportConfig {
-        force: args.force || (needs_flush && dirty_ids.is_empty()),
+        force: args.force,
         is_default_path: true,
         error_policy: export_policy,
         retention_days,
